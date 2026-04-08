@@ -29,6 +29,11 @@ class TelegramBotApi:
     async def close(self) -> None:
         await self._client.aclose()
 
+    async def get_me(self) -> dict[str, Any]:
+        result = await self._call("getMe", {})
+        assert isinstance(result, dict)
+        return result
+
     async def get_updates(
         self,
         *,
@@ -53,6 +58,7 @@ class TelegramBotApi:
         chat_id: int,
         text: str,
         reply_to_message_id: int | None = None,
+        entities: list[dict[str, Any]] | None = None,
         inline_keyboard: list[list[dict[str, Any]]] | None = None,
         disable_notification: bool = False,
     ) -> SentMessage:
@@ -63,6 +69,8 @@ class TelegramBotApi:
         }
         if reply_to_message_id is not None:
             payload["reply_parameters"] = {"message_id": reply_to_message_id}
+        if entities:
+            payload["entities"] = entities
         if inline_keyboard:
             payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
         result = await self._call("sendMessage", payload)
@@ -91,11 +99,33 @@ class TelegramBotApi:
 
     async def _call(self, method: str, payload: dict[str, Any]) -> Any:
         url = f"{self._base_url}/bot{self._bot_token}/{method}"
-        response = await self._client.post(url, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        if not data.get("ok"):
-            raise TelegramApiError(data.get("description", f"Telegram API call failed: {method}"))
+        try:
+            response = await self._client.post(url, json=payload)
+        except httpx.HTTPError as exc:
+            raise TelegramApiError(f"Telegram API request failed for {method}: {exc}") from exc
+
+        try:
+            data = response.json()
+        except ValueError:
+            data = None
+
+        if isinstance(data, dict) and not data.get("ok", False):
+            description = data.get("description") or f"Telegram API call failed: {method}"
+            error_code = data.get("error_code")
+            if error_code is not None:
+                raise TelegramApiError(f"{description} (error_code={error_code}, http_status={response.status_code})")
+            raise TelegramApiError(f"{description} (http_status={response.status_code})")
+
+        if response.is_error:
+            body = response.text.strip()
+            detail = f"HTTP {response.status_code}"
+            if body:
+                detail = f"{detail}: {body}"
+            raise TelegramApiError(f"Telegram API request failed for {method}: {detail}")
+
+        if not isinstance(data, dict):
+            raise TelegramApiError(f"Telegram API returned a non-JSON response for {method}")
+
         return data.get("result")
 
 

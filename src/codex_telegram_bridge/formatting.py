@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from collections.abc import Iterable
 from typing import Any
+
+from telegramify_markdown import convert, split_entities
+
+
+@dataclass(slots=True)
+class RenderedTextChunk:
+    text: str
+    entities: list[dict[str, Any]]
 
 
 def chunk_text(text: str, max_chars: int) -> list[str]:
@@ -51,32 +60,28 @@ def extract_latest_agent_message_from_turn(turn: dict[str, Any]) -> tuple[str | 
     return None, None
 
 
-
-def extract_latest_terminal_from_thread(thread: dict[str, Any]) -> dict[str, Any] | None:
+def extract_latest_agent_message_from_thread(thread: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
     turns = thread.get("turns") or []
     for turn in reversed(turns):
-        status = turn.get("status")
-        if status in {"completed", "failed", "interrupted"}:
-            item_id, text = extract_latest_agent_message_from_turn(turn)
-            error_message = None
-            error = turn.get("error") or {}
-            if error:
-                error_message = error.get("message")
-            return {
-                "turn_id": _coerce_turn_id(turn),
-                "status": status,
-                "item_id": item_id,
-                "text": text,
-                "error_message": error_message,
-            }
-    return None
+        item_id, text = extract_latest_agent_message_from_turn(turn)
+        if item_id is None or text is None:
+            continue
+        turn_id = turn.get("id")
+        return item_id, str(turn_id) if turn_id is not None else None, text
+    return None, None, None
 
 
-
-def format_external_message(header_template: str, *, preview: str | None, text: str) -> str:
-    preview_value = (preview or "Untitled thread").strip() or "Untitled thread"
-    return header_template.format(preview=preview_value, text=text)
-
+def render_markdown_chunks(markdown: str, max_utf16_len: int) -> list[RenderedTextChunk]:
+    text, entities = convert(markdown)
+    chunks = split_entities(text, entities, max_utf16_len=max_utf16_len)
+    return [
+        RenderedTextChunk(
+            text=chunk_text,
+            entities=[entity.to_dict() for entity in chunk_entities],
+        )
+        for chunk_text, chunk_entities in chunks
+        if chunk_text
+    ]
 
 
 def format_approval_prompt(kind: str, params: dict[str, Any], started_item: dict[str, Any] | None) -> str:
@@ -148,13 +153,6 @@ def _render_iterable(value: Any) -> str | None:
         if rendered:
             return "\n".join(f"• {item}" for item in rendered)
     return None
-
-
-
-def _coerce_turn_id(turn: dict[str, Any]) -> str | None:
-    turn_id = turn.get("id")
-    return str(turn_id) if turn_id is not None else None
-
 
 
 def _coerce_item_id(item: dict[str, Any]) -> str | None:

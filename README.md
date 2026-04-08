@@ -1,40 +1,26 @@
 # codex-telegram-bridge
 
-A minimal **reply-chain Telegram bridge** for **Codex app-server**.
+A minimal **reply-chain Telegram bridge** for **Codex Desktop**.
 
-The goal is simple:
+The bridge launches or connects to a local `Codex.app` instance with Electron remote debugging enabled, drives the composer through the renderer DOM, and reads thread state from the same renderer via CDP.
 
-- every **new Telegram message without a reply** starts a **new Codex thread**;
-- every **reply** to a bot/user message already bound to a Codex thread goes back to the **same thread**;
-- while a turn is running, follow-up user messages are sent as **`turn/steer`** when possible;
-- the bot sets **👀** on the user message when it is accepted for work and **✅** when the turn finishes;
-- approvals are surfaced as **reply messages with inline buttons** (**Approve** / **Deny**) and the prompt is deleted after the user clicks it.
+## Behavior
 
-This project intentionally stays small:
-
-- **no database** (`state.json` only)
-- **no slash commands in the bot UX**
-- **no fork flow**
-- **no aiogram / pyrogram** — plain Telegram Bot API over HTTP
-- **no direct parsing of Codex session files** as the primary control plane
-
-## Current behavior
-
-### Bot-created / bridge-controlled threads
-
-For threads started from Telegram (or later resumed by the bridge), the bridge uses **live app-server events**.
-
-### External CLI / Desktop threads
-
-An optional poller uses `thread/list` + `thread/read` to detect new terminal turns and forward final answers into Telegram.
-This is **best effort**. It works well for passive mirroring and lightweight takeovers, but it does **not** promise perfect live control over an already-running TUI/Desktop turn.
+- every **new Telegram message without a reply** opens a **project picker** in Telegram, then starts a **new Codex Desktop thread** in the selected project
+- every **reply** to a known Telegram chain goes back to the **same Desktop thread**
+- `attach <thread_id>` binds an existing visible Desktop thread to the current Telegram chat and sends its latest assistant message
+- `attach` without an id opens a picker of recent Desktop sessions in Telegram
+- while a turn is running, extra Telegram inputs are **queued** and sent after the current turn finishes
+- the bot sets **👀** on accepted user messages and **👌** when the related turn reaches a terminal state
+- assistant Markdown is converted with `telegramify-markdown`
+- Desktop approval prompts are surfaced in Telegram with **Approve** / **Deny** buttons
 
 ## Requirements
 
 - Python **3.11+**
-- `codex` available on your `PATH`
+- local **Codex Desktop** installed at `/Applications/Codex.app` or another configured path
 - a Telegram bot token
-- access to the same local Codex home / sessions as the Codex instance you want to mirror/control
+- access to the same local Codex Desktop profile / sessions you want the bridge to control
 
 ## Install
 
@@ -50,18 +36,10 @@ uv pip install -e .
 uv tool install .
 ```
 
-That gives you a console command:
+That gives you:
 
 ```bash
 codex-telegram-bridge --help
-```
-
-### Install from Git
-
-Once this repository is on GitHub:
-
-```bash
-uv tool install git+https://github.com/<you>/codex-telegram-bridge
 ```
 
 ## Quick start
@@ -72,13 +50,11 @@ Create a config file:
 codex-telegram-bridge init-config --path ~/.config/codex-telegram-bridge/config.toml
 ```
 
-Edit it and set at least:
+Set at least:
 
 - `telegram.bot_token`
-- optionally `telegram.primary_chat_id`
-- optionally `codex.thread_start.cwd`
-- optionally `codex.thread_start.approvalPolicy`
-- optionally `codex.thread_start.sandbox`
+- optionally `desktop.app_path`
+- optionally `desktop.user_data_dir`
 
 Then run:
 
@@ -94,34 +70,10 @@ See [`config.example.toml`](./config.example.toml).
 
 ## UX model
 
-### Routing
-
-- **New message** → start a new thread
-- **Reply to any known thread message** → route back to that thread
-- **Bot replies to your message** → keeps the whole thread as a single Telegram reply chain
-
-### Reactions
-
-- **👀** = accepted / in progress
-- **✅** = turn reached a terminal state and the bridge finished handling it
-
-### Approvals
-
-When Codex requests approval for:
-
-- command execution
-- file changes
-- permission grants
-
-…the bridge sends a **reply message** in Telegram with buttons:
-
-- **Approve**
-- **Deny**
-
-When the button is pressed:
-
-- the bridge answers the app-server request
-- the approval message is deleted
+- **New message** → choose a Desktop project in Telegram, then create a new Desktop thread there
+- **Reply to a known thread message** → same Desktop thread
+- **`attach <thread_id>`** → make Telegram the active continuation point for an existing Desktop thread
+- **Bot replies to your message** → the whole conversation stays in one Telegram reply chain
 
 ## Commands
 
@@ -130,9 +82,16 @@ codex-telegram-bridge init-config [--path PATH]
 codex-telegram-bridge run [--config PATH]
 ```
 
-## State model
+Telegram control commands:
 
-All persistent state lives in a single JSON file (by default):
+```text
+attach <thread_id>
+attach
+```
+
+## State
+
+Persistent state lives in:
 
 ```text
 ~/.local/state/codex-telegram-bridge/state.json
@@ -142,53 +101,29 @@ It stores:
 
 - Telegram update offset
 - primary chat id
-- Telegram message → Codex thread bindings
-- thread metadata
-- last delivered items
-- pending / queued user messages
+- Telegram message → Desktop thread bindings
+- last delivered thread items
+- queued user inputs
 
 ## Limitations
 
 - The bridge is optimized for **one-user private chat** usage.
-- External session mirroring is **best effort**.
-- `tool/requestUserInput` and MCP elicitation requests are only surfaced as “handle locally” notices for now.
-- The bridge does not implement a rich approval matrix; buttons are intentionally **Approve** / **Deny** only.
-- It does not try to become a perfect multi-client coordinator for Desktop + CLI + bot at the same time.
+- It assumes **Codex Desktop is the only real writer** for the controlled threads.
+- Do not run a second plain Codex Desktop instance against the same profile while the bridge-owned instance is active.
+- Queueing replaces the old app-server `turn/steer` path.
+- The bridge only sees threads that are visible through the current Desktop renderer state.
+- The DOM / React contract is private Codex Desktop implementation detail, so upstream UI changes can break the bridge.
 
 ## Development
 
 Run tests:
 
 ```bash
-PYTHONPATH=src pytest
+uv run pytest
 ```
 
 Run locally without installing:
 
 ```bash
-PYTHONPATH=src python -m codex_telegram_bridge run --config ./config.example.toml
+PYTHONPATH=src uv run python -m codex_telegram_bridge.cli run --config ./config.example.toml
 ```
-
-## Packaging and publishing
-
-Build distributions with `uv`:
-
-```bash
-uv build
-```
-
-Publish when you are ready:
-
-```bash
-uv publish
-```
-
-Or install directly from a Git repo as a tool:
-
-```bash
-uv tool install git+https://github.com/<you>/codex-telegram-bridge
-```
-
-## License
-
-MIT

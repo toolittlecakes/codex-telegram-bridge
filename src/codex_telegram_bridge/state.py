@@ -21,7 +21,6 @@ class ThreadState:
     last_chain_message_id: int | None = None
     last_delivered_turn_id: str | None = None
     last_delivered_item_id: str | None = None
-    last_seen_updated_at: int | None = None
     current_turn_id: str | None = None
     pending_message_ids: list[int] = field(default_factory=list)
     queued_inputs: list[QueuedInput] = field(default_factory=list)
@@ -57,7 +56,6 @@ class BridgeState:
                 last_chain_message_id=thread_raw.get("last_chain_message_id"),
                 last_delivered_turn_id=thread_raw.get("last_delivered_turn_id"),
                 last_delivered_item_id=thread_raw.get("last_delivered_item_id"),
-                last_seen_updated_at=thread_raw.get("last_seen_updated_at"),
                 current_turn_id=thread_raw.get("current_turn_id"),
                 pending_message_ids=list(thread_raw.get("pending_message_ids", [])),
                 queued_inputs=queued,
@@ -85,7 +83,6 @@ class BridgeState:
                     "last_chain_message_id": state.last_chain_message_id,
                     "last_delivered_turn_id": state.last_delivered_turn_id,
                     "last_delivered_item_id": state.last_delivered_item_id,
-                    "last_seen_updated_at": state.last_seen_updated_at,
                     "current_turn_id": state.current_turn_id,
                     "pending_message_ids": state.pending_message_ids,
                     "queued_inputs": [asdict(item) for item in state.queued_inputs],

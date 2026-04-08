@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import signal
+import sys
 from pathlib import Path
 
 from .bridge import BridgeApp
 from .config import DEFAULT_CONFIG_PATH, EXAMPLE_CONFIG, ensure_parent_dirs, load_config
+from .desktop_client import DesktopClientError
 from .state import BridgeState
+from .telegram_api import TelegramApiError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,7 +51,15 @@ def main() -> None:
         return
 
     if args.command == "run":
-        asyncio.run(_run(args.config))
+        try:
+            asyncio.run(_run(args.config))
+        except (ValueError, TelegramApiError, DesktopClientError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(1) from None
+        except FileNotFoundError as exc:
+            missing = exc.filename or "required command"
+            print(f"Error: failed to start {missing}", file=sys.stderr)
+            raise SystemExit(1) from None
         return
 
     parser.error(f"Unknown command: {args.command}")
@@ -60,10 +72,10 @@ async def _run(config_path: Path) -> None:
         level=getattr(logging, config.bridge.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     state = BridgeState.load(config.bridge.state_path)
-    for thread in state.threads.values():
-        thread.current_turn_id = None
+    state.reset_ephemeral_runtime_state()
     app = BridgeApp(config, state)
 
     loop = asyncio.get_running_loop()
@@ -72,9 +84,6 @@ async def _run(config_path: Path) -> None:
             loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(app.stop()))
 
     await app.run()
-
-
-import contextlib  # noqa: E402  (kept near _run to avoid top-level unused import noise)
 
 
 if __name__ == "__main__":  # pragma: no cover

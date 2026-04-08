@@ -4,9 +4,10 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
+HTMLISH_STDERR_PREFIXES = ("<html", "</html", "<head", "</head", "<body", "</body", "<div", "</div", "<svg", "<path", "<meta", "<style", "</style")
 
 NotificationHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 RequestHandler = Callable[[str, int | str, dict[str, Any]], Awaitable[None]]
@@ -167,11 +168,7 @@ class CodexAppServerClient:
     async def _stdout_loop(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
         try:
-            while True:
-                line = await self._proc.stdout.readline()
-                if not line:
-                    break
-                raw = line.decode("utf-8").strip()
+            async for raw in self._iter_lines(self._proc.stdout):
                 if not raw:
                     continue
                 logger.debug("codex <- %s", raw)
@@ -190,14 +187,15 @@ class CodexAppServerClient:
 
     async def _stderr_loop(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
+        suppress_html_block = False
         try:
-            while True:
-                line = await self._proc.stderr.readline()
-                if not line:
-                    break
-                raw = line.decode("utf-8", errors="replace").rstrip()
-                if raw:
-                    logger.info("codex stderr: %s", raw)
+            async for raw in self._iter_lines(self._proc.stderr, errors="replace"):
+                if not raw:
+                    continue
+                rendered, level, suppress_html_block = self._classify_stderr_line(raw, suppress_html_block)
+                if rendered is None:
+                    continue
+                logger.log(level, "codex stderr: %s", rendered)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -236,6 +234,56 @@ class CodexAppServerClient:
             if not future.done():
                 future.set_exception(exc)
         self._pending.clear()
+
+    async def _iter_lines(
+        self,
+        stream: asyncio.StreamReader,
+        *,
+        encoding: str = "utf-8",
+        errors: str = "strict",
+        chunk_size: int = 65536,
+    ) -> AsyncIterator[str]:
+        buffer = bytearray()
+        while True:
+            chunk = await stream.read(chunk_size)
+            if not chunk:
+                if buffer:
+                    yield buffer.decode(encoding, errors=errors).rstrip("\r")
+                break
+
+            buffer.extend(chunk)
+            start = 0
+            while True:
+                newline_index = buffer.find(b"\n", start)
+                if newline_index == -1:
+                    if start:
+                        del buffer[:start]
+                    break
+                yield buffer[start:newline_index].decode(encoding, errors=errors).rstrip("\r")
+                start = newline_index + 1
+
+    def _classify_stderr_line(
+        self,
+        raw: str,
+        suppress_html_block: bool,
+    ) -> tuple[str | None, int, bool]:
+        stripped = raw.strip()
+        if not stripped:
+            return None, logging.DEBUG, suppress_html_block
+
+        if "failed to warm featured plugin ids cache" in stripped and "403 Forbidden" in stripped:
+            return "failed to warm featured plugin ids cache (403 Forbidden)", logging.WARNING, True
+
+        if suppress_html_block:
+            if "</html>" in stripped:
+                return None, logging.DEBUG, False
+            return None, logging.DEBUG, True
+
+        lowered = stripped.lower()
+        if lowered.startswith(HTMLISH_STDERR_PREFIXES):
+            return None, logging.DEBUG, "</html>" not in lowered
+
+        return raw, logging.INFO, suppress_html_block
 
 
 __all__ = ["CodexAppServerClient", "InitializeResult", "JsonRpcError"]

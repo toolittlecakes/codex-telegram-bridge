@@ -6,45 +6,18 @@ bot_token = "123456:replace-me"
 # Optional additional allow-list. If omitted, the bridge uses primary_chat_id / first private chat.
 # allowed_chat_ids = [123456789]
 processing_reaction = "👀"
-done_reaction = "✅"
+done_reaction = "👌"
 delete_approval_messages = true
 
-[codex]
-command = ["codex", "app-server", "--listen", "stdio://"]
-client_name = "codex_telegram_bridge"
-client_title = "Codex Telegram Bridge"
-client_version = "0.1.0"
-experimental_api = false
-# You can remove entries here if you want more live noise from Codex.
-opt_out_notification_methods = [
-  "item/agentMessage/delta",
-  "item/reasoning/summaryTextDelta",
-  "item/reasoning/summaryPartAdded",
-  "item/reasoning/textDelta",
-  "item/plan/delta",
-  "item/commandExecution/outputDelta",
-  "item/fileChange/outputDelta",
-]
-
-# Passed to thread/start for brand new threads created by the bot.
-[codex.thread_start]
-# cwd = "/Users/me/project"
-# model = "gpt-5.4"
-# approvalPolicy = "unlessTrusted"
-# sandbox = "workspaceWrite"
-# personality = "friendly"
-
-# Passed to turn/start in addition to input. Usually left empty.
-[codex.turn_start_defaults]
-# approvalsReviewer = "user"
+[desktop]
+app_path = "/Applications/Codex.app"
+user_data_dir = "~/Library/Application Support/com.openai.chat"
+remote_debugging_port = 9229
+launch_timeout_seconds = 30
+poll_interval_seconds = 1
 
 [bridge]
 state_path = "~/.local/state/codex-telegram-bridge/state.json"
-poll_external_threads = true
-external_poll_interval_seconds = 3.0
-external_poll_limit = 100
-# Leave this list alone unless your Codex build rejects some source kinds.
-external_source_kinds = ["cli", "vscode", "exec", "appServer", "unknown"]
 allow_first_private_chat = true
 max_message_chars = 3900
 log_level = "INFO"

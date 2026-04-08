@@ -5,22 +5,23 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "codex-telegram-bridge"
 version = "0.1.0"
-description = "Reply-chain Telegram bridge for Codex app-server"
+description = "Reply-chain Telegram bridge for Codex Desktop"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
   {name = "OpenAI ChatGPT"}
 ]
 dependencies = [
   "httpx>=0.28,<1.0",
+  "telegramify-markdown>=1.1.2,<2.0",
+  "websockets>=15.0,<16.0",
 ]
 keywords = ["codex", "telegram", "bot", "bridge", "openai"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
@@ -38,6 +39,7 @@ Issues = "https://github.com/yourname/codex-telegram-bridge/issues"
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0,<9.0",
+  "pytest-asyncio>=0.23,<1.0",
 ]
 
 [project.scripts]
@@ -52,3 +54,4 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+asyncio_mode = "auto"
