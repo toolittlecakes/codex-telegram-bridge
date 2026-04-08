@@ -628,6 +628,44 @@ async def test_attach_command_binds_existing_thread_and_sends_latest_message(app
 
 
 @pytest.mark.asyncio
+async def test_attach_command_skips_in_progress_partial_and_sends_latest_terminal_message(app: BridgeApp) -> None:
+    app.state.primary_chat_id = 1234
+    app.desktop.threads["thr_attached"] = make_conversation(
+        "thr_attached",
+        title="Existing thread",
+        turns=[
+            make_turn(
+                "turn_1",
+                "completed",
+                items=[{"id": "item_1", "type": "agentMessage", "text": "Stable reply"}],
+            ),
+            make_turn(
+                "turn_2",
+                "inProgress",
+                items=[{"id": "item_partial", "type": "agentMessage", "text": "Streaming partial"}],
+            ),
+        ],
+    )
+
+    await app._process_telegram_update(
+        {
+            "message": {
+                "message_id": 111,
+                "chat": {"id": 1234, "type": "private"},
+                "from": {"id": 1, "is_bot": False},
+                "text": "attach thr_attached",
+            }
+        }
+    )
+
+    assert len(app.telegram.sent_messages) == 2
+    assert app.telegram.sent_messages[1]["text"] == "Stable reply"
+    assert app.state.threads["thr_attached"].current_turn_id == "turn_2"
+    assert app.state.threads["thr_attached"].last_delivered_item_id == "item_1"
+    assert app.state.threads["thr_attached"].last_delivered_turn_id == "turn_1"
+
+
+@pytest.mark.asyncio
 async def test_attach_without_id_prompts_for_recent_sessions(app: BridgeApp) -> None:
     app.state.primary_chat_id = 1234
     app.desktop.thread_summaries = [
@@ -1017,6 +1055,7 @@ class StartThreadProbeClient(CodexDesktopClient):
         *,
         list_threads_sequence: list[list[DesktopConversationSummary]],
         conversations: dict[str, DesktopConversation],
+        composer_text: str = "",
     ) -> None:
         super().__init__(
             app_path=Path("/Applications/Codex.app"),
@@ -1029,6 +1068,7 @@ class StartThreadProbeClient(CodexDesktopClient):
         self._conversations = {thread_id: copy.deepcopy(conversation) for thread_id, conversation in conversations.items()}
         self.clicked_project_paths: list[str] = []
         self.inserted_texts: list[str] = []
+        self.composer_text = composer_text
 
     async def list_threads(self) -> list[DesktopConversationSummary]:
         if not self._list_threads_sequence:
@@ -1047,6 +1087,9 @@ class StartThreadProbeClient(CodexDesktopClient):
 
     async def _focus_composer(self) -> None:
         return None
+
+    async def _read_composer_text(self) -> str:
+        return self.composer_text
 
     async def _insert_text(self, text: str) -> None:
         self.inserted_texts.append(text)
@@ -1193,6 +1236,22 @@ async def test_desktop_client_start_new_thread_waits_for_matching_first_user_mes
     assert result.thread_id == "thr_right"
     assert client.clicked_project_paths == ["/repo"]
     assert client.inserted_texts == ["hello\n"]
+    await client._http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_desktop_client_start_new_thread_fails_when_composer_contains_draft() -> None:
+    old_summary = DesktopConversationSummary(thread_id="thr_old", title="Old", current=True, cwd="/repo")
+    client = StartThreadProbeClient(
+        list_threads_sequence=[[old_summary]],
+        conversations={},
+        composer_text="unsent desktop draft",
+    )
+
+    with pytest.raises(DesktopClientError, match="Desktop composer is not empty for a new thread"):
+        await client.start_new_thread("/repo", "hello")
+
+    assert client.inserted_texts == []
     await client._http.aclose()
 
 

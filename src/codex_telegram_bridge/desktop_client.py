@@ -217,6 +217,12 @@ class CodexDesktopClient:
             raise DesktopClientError(f"Desktop project {project_path!r} is not available for starting a new thread.")
         await self._click_project_new_thread_button(project.path)
         await asyncio.sleep(self._poll_interval_seconds)
+        composer_text = await self._read_composer_text()
+        if composer_text.strip():
+            raise DesktopClientError(
+                "Desktop composer is not empty for a new thread. "
+                "Send or discard the draft in Codex Desktop, then retry."
+            )
         await self._focus_composer()
         await self._insert_text(text.rstrip() + "\n")
         clicked = await self._eval_json(_click_send_button_js())

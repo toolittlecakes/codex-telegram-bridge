@@ -321,7 +321,7 @@ class BridgeApp:
         thread_state.last_chain_message_id = confirmation.message_id
         await self._save_state()
 
-        latest = self._extract_latest_agent_message_from_conversation(conversation)
+        latest = self._extract_latest_terminal_agent_message_from_conversation(conversation)
         if latest is None:
             return
         item_id, turn_id, latest_text = latest
@@ -1002,11 +1002,13 @@ class BridgeApp:
         argument = remainder.strip() or None
         return normalized, argument
 
-    def _extract_latest_agent_message_from_conversation(
+    def _extract_latest_terminal_agent_message_from_conversation(
         self,
         conversation: DesktopConversation,
     ) -> tuple[str, str | None, str] | None:
         for turn in reversed(conversation.turns):
+            if not turn.is_terminal:
+                continue
             item_id, text = extract_latest_agent_message_from_turn(turn.raw)
             if item_id is None or text is None:
                 continue
