@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +93,7 @@ class DesktopConversationSummary:
     cwd: str | None
     project_label: str | None = None
     project_path: str | None = None
+    updated_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -173,6 +175,7 @@ class CodexDesktopClient:
                     cwd=conversation.cwd,
                     project_label=str(raw.get("projectLabel")) if raw.get("projectLabel") is not None else None,
                     project_path=str(raw.get("projectPath")) if raw.get("projectPath") is not None else None,
+                    updated_at=_coerce_datetime_optional(raw.get("updatedAt")),
                 )
             )
         return result
@@ -208,6 +211,7 @@ class CodexDesktopClient:
 
     async def start_new_thread(self, project_path: str, text: str) -> DesktopConversation:
         before = {thread.thread_id for thread in await self.list_threads()}
+        expected_text = text.strip()
         project = await self._project_for_path(project_path)
         if project is None:
             raise DesktopClientError(f"Desktop project {project_path!r} is not available for starting a new thread.")
@@ -217,7 +221,9 @@ class CodexDesktopClient:
         await self._insert_text(text.rstrip() + "\n")
         clicked = await self._eval_json(_click_send_button_js())
         if not clicked or not clicked.get("ok"):
-            raise DesktopClientError("Desktop send button is not available for a new thread.")
+            error = clicked.get("error") if isinstance(clicked, dict) else None
+            detail = f" ({error})" if isinstance(error, str) and error else ""
+            raise DesktopClientError(f"Desktop send button is not available for a new thread{detail}.")
 
         deadline = asyncio.get_running_loop().time() + self._launch_timeout_seconds
         while True:
@@ -225,13 +231,17 @@ class CodexDesktopClient:
             for thread in threads:
                 if thread.thread_id not in before:
                     conversation = await self.read_thread(thread.thread_id)
-                    if conversation is not None:
+                    if conversation is not None and _conversation_has_user_message(
+                        conversation,
+                        expected_text=expected_text,
+                        after_turn_count=0,
+                    ):
                         return conversation
             if asyncio.get_running_loop().time() > deadline:
                 break
             await asyncio.sleep(self._poll_interval_seconds)
         raise DesktopClientError(
-            f"Desktop did not expose a new thread after sending the first message in project {project.label!r}."
+            f"Desktop did not expose the new thread with the expected first message in project {project.label!r}."
         )
 
     async def activate_thread(self, thread_id: str) -> DesktopConversation:
@@ -257,9 +267,14 @@ class CodexDesktopClient:
         before = await self.read_thread(thread_id)
         if before is None:
             raise DesktopClientError(f"Desktop thread {thread_id} is not available for sending.")
-        before_turn_count = len(before.turns)
-        expected_text = text.strip()
+        _raise_if_thread_turn_is_active(thread_id, before)
         await self.activate_thread(thread_id)
+        baseline = await self.read_thread(thread_id)
+        if baseline is None:
+            raise DesktopClientError(f"Desktop thread {thread_id} is not available for sending.")
+        _raise_if_thread_turn_is_active(thread_id, baseline)
+        before_turn_count = len(baseline.turns)
+        expected_text = text.strip()
         composer_text = await self._read_composer_text()
         if composer_text.strip():
             raise DesktopClientError(
@@ -270,7 +285,12 @@ class CodexDesktopClient:
         await self._insert_text(text.rstrip() + "\n")
         clicked = await self._eval_json(_click_send_button_js())
         if not clicked or not clicked.get("ok"):
-            raise DesktopClientError("Desktop send button is not available.")
+            latest = await self.read_thread(thread_id)
+            if latest is not None:
+                _raise_if_thread_turn_is_active(thread_id, latest)
+            error = clicked.get("error") if isinstance(clicked, dict) else None
+            detail = f" ({error})" if isinstance(error, str) and error else ""
+            raise DesktopClientError(f"Desktop send button is not available{detail}.")
 
         deadline = asyncio.get_running_loop().time() + self._launch_timeout_seconds
         while True:
@@ -561,6 +581,16 @@ class CodexDesktopClient:
 
 def _quote_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def _coerce_datetime_optional(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        timestamp_ms = int(value)
+    except (TypeError, ValueError):
+        return None
+    return datetime.fromtimestamp(timestamp_ms / 1000)
 
 
 def _conversation_has_user_message(
@@ -1007,21 +1037,46 @@ def _click_send_button_js() -> str:
     return """
 (() => {
   const composer = document.querySelector('.ProseMirror[contenteditable="true"]');
-  if (!composer) return { ok: false };
-  const composerRect = composer.getBoundingClientRect();
-  const button = [...document.querySelectorAll('button')].find((node) => {
-    const cls = node.className || '';
-    if (typeof cls !== 'string' || !cls.includes('size-token-button-composer')) {
-      return false;
-    }
-    const rect = node.getBoundingClientRect();
-    return rect.x > composerRect.x + composerRect.width - 120 && Math.abs(rect.y - composerRect.y) < 80;
-  });
-  if (!button) return { ok: false };
+  if (!composer) return { ok: false, error: 'no-composer' };
+  const panel = composer.closest('div.bg-token-input-background');
+  if (!panel) return { ok: false, error: 'no-composer-panel' };
+  const button = [...panel.querySelectorAll('button')]
+    .filter((node) => {
+      const cls = node.className || '';
+      if (typeof cls !== 'string') {
+        return false;
+      }
+      const rect = node.getBoundingClientRect();
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        (cls.includes('size-token-button-composer') || cls.includes('bg-token-foreground'))
+      );
+    })
+    .sort((left, right) => {
+      const leftRect = left.getBoundingClientRect();
+      const rightRect = right.getBoundingClientRect();
+      if (leftRect.x !== rightRect.x) {
+        return rightRect.x - leftRect.x;
+      }
+      return rightRect.y - leftRect.y;
+    })[0];
+  if (!button) return { ok: false, error: 'send-button-not-found' };
+  if (button.disabled) return { ok: false, error: 'send-button-disabled' };
   button.click();
   return { ok: true };
 })()
 """
+
+
+def _raise_if_thread_turn_is_active(thread_id: str, conversation: DesktopConversation) -> None:
+    latest_turn = conversation.latest_turn
+    if latest_turn is None or latest_turn.is_terminal:
+        return
+    turn_id = latest_turn.turn_id or "unknown"
+    raise DesktopClientError(
+        f"Desktop thread {thread_id} is still running turn {turn_id}. Wait for it to finish, then retry."
+    )
 
 
 __all__ = [

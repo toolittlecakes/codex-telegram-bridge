@@ -10,6 +10,7 @@ The bridge launches or connects to a local `Codex.app` instance with Electron re
 - every **reply** to a known Telegram chain goes back to the **same Desktop thread**
 - `attach <thread_id>` binds an existing visible Desktop thread to the current Telegram chat and sends its latest assistant message
 - `attach` without an id opens a picker of recent Desktop sessions in Telegram
+- `detach <thread_id>` or reply-`detach` stops Telegram sync for that Desktop thread and removes its bindings
 - while a turn is running, extra Telegram inputs are **queued** and sent after the current turn finishes
 - the bot sets **👀** on accepted user messages and **👌** when the related turn reaches a terminal state
 - assistant Markdown is converted with `telegramify-markdown`
@@ -73,6 +74,7 @@ See [`config.example.toml`](./config.example.toml).
 - **New message** → choose a Desktop project in Telegram, then create a new Desktop thread there
 - **Reply to a known thread message** → same Desktop thread
 - **`attach <thread_id>`** → make Telegram the active continuation point for an existing Desktop thread
+- **`detach`** → stop syncing a previously attached thread
 - **Bot replies to your message** → the whole conversation stays in one Telegram reply chain
 
 ## Commands
@@ -87,6 +89,8 @@ Telegram control commands:
 ```text
 attach <thread_id>
 attach
+detach <thread_id>
+detach
 ```
 
 ## State

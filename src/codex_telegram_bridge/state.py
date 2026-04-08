@@ -35,8 +35,9 @@ class ApprovalCleanupMessage:
 
 @dataclass(slots=True)
 class BridgeState:
-    version: int = 1
+    version: int = 2
     telegram_update_offset: int = 0
+    next_callback_key: int = 0
     primary_chat_id: int | None = None
     message_bindings: dict[str, str] = field(default_factory=dict)
     threads: dict[str, ThreadState] = field(default_factory=dict)
@@ -65,6 +66,7 @@ class BridgeState:
         return BridgeState(
             version=int(raw.get("version", 1)),
             telegram_update_offset=int(raw.get("telegram_update_offset", 0)),
+            next_callback_key=int(raw.get("next_callback_key", 0)),
             primary_chat_id=raw.get("primary_chat_id"),
             message_bindings={str(k): str(v) for k, v in (raw.get("message_bindings") or {}).items()},
             threads=threads,
@@ -75,6 +77,7 @@ class BridgeState:
         payload = {
             "version": self.version,
             "telegram_update_offset": self.telegram_update_offset,
+            "next_callback_key": self.next_callback_key,
             "primary_chat_id": self.primary_chat_id,
             "message_bindings": self.message_bindings,
             "threads": {
@@ -113,6 +116,14 @@ class BridgeState:
     def lookup_thread_for_message(self, chat_id: int, message_id: int) -> str | None:
         return self.message_bindings.get(self._message_key(chat_id, message_id))
 
+    def remove_thread(self, thread_id: str) -> None:
+        self.threads.pop(thread_id, None)
+        self.message_bindings = {
+            message_key: bound_thread_id
+            for message_key, bound_thread_id in self.message_bindings.items()
+            if bound_thread_id != thread_id
+        }
+
     @staticmethod
     def _message_key(chat_id: int, message_id: int) -> str:
         return f"{chat_id}:{message_id}"
@@ -120,7 +131,6 @@ class BridgeState:
     def reset_ephemeral_runtime_state(self) -> None:
         for thread in self.threads.values():
             thread.current_turn_id = None
-        self.approval_cleanup_messages = []
 
 
 __all__ = [

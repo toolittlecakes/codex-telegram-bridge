@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Iterable
+import re
 from typing import Any
 
 from telegramify_markdown import convert, split_entities
@@ -11,6 +12,11 @@ from telegramify_markdown import convert, split_entities
 class RenderedTextChunk:
     text: str
     entities: list[dict[str, Any]]
+
+
+_LOCAL_MARKDOWN_LINK_RE = re.compile(
+    r"\[(?P<label>[^\]]+)\]\((?P<target>(?:/[^)\s]+|file://[^)\s]+))\)"
+)
 
 
 def chunk_text(text: str, max_chars: int) -> list[str]:
@@ -72,7 +78,8 @@ def extract_latest_agent_message_from_thread(thread: dict[str, Any]) -> tuple[st
 
 
 def render_markdown_chunks(markdown: str, max_utf16_len: int) -> list[RenderedTextChunk]:
-    text, entities = convert(markdown)
+    sanitized_markdown = _replace_local_markdown_links(markdown)
+    text, entities = convert(sanitized_markdown)
     chunks = split_entities(text, entities, max_utf16_len=max_utf16_len)
     return [
         RenderedTextChunk(
@@ -158,3 +165,15 @@ def _render_iterable(value: Any) -> str | None:
 def _coerce_item_id(item: dict[str, Any]) -> str | None:
     item_id = item.get("id")
     return str(item_id) if item_id is not None else None
+
+
+def _replace_local_markdown_links(markdown: str) -> str:
+    return _LOCAL_MARKDOWN_LINK_RE.sub(_render_local_markdown_link, markdown)
+
+
+def _render_local_markdown_link(match: re.Match[str]) -> str:
+    label = match.group("label").strip()
+    target = match.group("target").strip()
+    if not label:
+        return target
+    return f"{label} ({target})"

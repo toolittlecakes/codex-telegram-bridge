@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import fcntl
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
@@ -13,6 +15,10 @@ from .config import DEFAULT_CONFIG_PATH, EXAMPLE_CONFIG, ensure_parent_dirs, loa
 from .desktop_client import DesktopClientError
 from .state import BridgeState
 from .telegram_api import TelegramApiError
+
+
+class SingleInstanceError(RuntimeError):
+    pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,7 +59,7 @@ def main() -> None:
     if args.command == "run":
         try:
             asyncio.run(_run(args.config))
-        except (ValueError, TelegramApiError, DesktopClientError) as exc:
+        except (ValueError, TelegramApiError, DesktopClientError, SingleInstanceError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             raise SystemExit(1) from None
         except FileNotFoundError as exc:
@@ -83,7 +89,35 @@ async def _run(config_path: Path) -> None:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(app.stop()))
 
-    await app.run()
+    with _hold_single_instance_lock(config.bridge.state_path):
+        await app.run()
+
+
+@contextlib.contextmanager
+def _hold_single_instance_lock(state_path: Path):
+    lock_path = state_path.with_suffix(".run.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.seek(0)
+            holder = handle.read().strip()
+            detail = f" Another instance is holding {lock_path}."
+            if holder:
+                detail = f" Another instance is holding {lock_path}: {holder}."
+            raise SingleInstanceError(f"Another codex-telegram-bridge instance is already running.{detail}") from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\n")
+        handle.flush()
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            handle.truncate()
+            handle.flush()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 if __name__ == "__main__":  # pragma: no cover

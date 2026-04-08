@@ -73,7 +73,6 @@ class BridgeApp:
         self._pending_project_selections: dict[str, PendingProjectSelection] = {}
         self._pending_attach_selections: dict[str, PendingAttachSelection] = {}
         self._missing_thread_counts: dict[str, int] = {}
-        self._next_approval_key = 0
         self._state_lock = asyncio.Lock()
 
     async def run(self) -> None:
@@ -145,13 +144,15 @@ class BridgeApp:
 
             for update in updates:
                 update_id = int(update["update_id"])
-                offset = max(offset, update_id + 1)
-                self.state.telegram_update_offset = offset
-                await self._save_state()
                 try:
                     await self._process_telegram_update(update)
                 except Exception:
                     logger.exception("Failed handling Telegram update: %s", update)
+                    await asyncio.sleep(2)
+                    break
+                offset = max(offset, update_id + 1)
+                self.state.telegram_update_offset = offset
+                await self._save_state()
 
     async def _thread_sync_loop(self) -> None:
         interval = self.config.desktop.poll_interval_seconds
@@ -211,6 +212,9 @@ class BridgeApp:
                 argument=control[1],
                 chat_id=chat_id,
                 message_id=int(message["message_id"]),
+                reply_to_message_id=int((message.get("reply_to_message") or {}).get("message_id"))
+                if (message.get("reply_to_message") or {}).get("message_id") is not None
+                else None,
             )
             return
 
@@ -267,9 +271,18 @@ class BridgeApp:
         argument: str | None,
         chat_id: int,
         message_id: int,
+        reply_to_message_id: int | None,
     ) -> None:
         if command == "attach":
             await self._handle_attach_command(chat_id=chat_id, message_id=message_id, thread_id=argument)
+            return
+        if command == "detach":
+            await self._handle_detach_command(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_to_message_id=reply_to_message_id,
+                thread_id=argument,
+            )
             return
 
     async def _handle_attach_command(self, *, chat_id: int, message_id: int, thread_id: str | None) -> None:
@@ -321,6 +334,42 @@ class BridgeApp:
             thread_state.last_delivered_item_id = item_id
             thread_state.last_delivered_turn_id = turn_id
             await self._save_state()
+
+    async def _handle_detach_command(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        reply_to_message_id: int | None,
+        thread_id: str | None,
+    ) -> None:
+        normalized_thread_id = (thread_id or "").strip()
+        if not normalized_thread_id and reply_to_message_id is not None:
+            normalized_thread_id = self.state.lookup_thread_for_message(chat_id, reply_to_message_id) or ""
+        if not normalized_thread_id:
+            await self._safe_send_message(
+                chat_id=chat_id,
+                text="Usage: detach <thread_id> or reply with `detach` to a known bridge thread.",
+                reply_to_message_id=message_id,
+            )
+            return
+        if normalized_thread_id not in self.state.threads:
+            await self._safe_send_message(
+                chat_id=chat_id,
+                text=f"Thread {normalized_thread_id} is not currently attached to Telegram.",
+                reply_to_message_id=message_id,
+            )
+            return
+
+        await self._clear_thread_approvals(normalized_thread_id)
+        self.state.remove_thread(normalized_thread_id)
+        self._missing_thread_counts.pop(normalized_thread_id, None)
+        await self._save_state()
+        await self._safe_send_message(
+            chat_id=chat_id,
+            text=f"Detached thread {normalized_thread_id}. Telegram will stop receiving updates from it.",
+            reply_to_message_id=message_id,
+        )
 
     async def _handle_callback_query(self, callback_query: dict[str, Any]) -> None:
         callback_id = str(callback_query["id"])
@@ -748,6 +797,12 @@ class BridgeApp:
         self._forget_cleanup_message(chat_id=pending.chat_id, message_id=pending.message_id)
         await self._save_state()
 
+    async def _clear_thread_approvals(self, thread_id: str) -> None:
+        for callback_key, pending in list(self._pending_approvals.items()):
+            if pending.thread_id != thread_id:
+                continue
+            await self._clear_pending_approval(callback_key, delete_message=self.config.telegram.delete_approval_messages)
+
     async def _sync_turn_state(self, thread_state: ThreadState, conversation: DesktopConversation) -> bool:
         latest_turn = conversation.latest_turn
         if latest_turn is None:
@@ -763,7 +818,10 @@ class BridgeApp:
             changed = True
 
         if latest_turn.is_terminal:
-            if await self._deliver_terminal_turn(thread_state, latest_turn):
+            needs_delivery = self._terminal_turn_needs_delivery(thread_state, latest_turn)
+            if needs_delivery:
+                if not await self._deliver_terminal_turn(thread_state, latest_turn):
+                    return changed
                 changed = True
             if thread_state.pending_message_ids:
                 await self._mark_pending_messages_done(thread_state)
@@ -805,6 +863,17 @@ class BridgeApp:
 
         return False
 
+    def _terminal_turn_needs_delivery(self, thread_state: ThreadState, turn: Any) -> bool:
+        turn_payload = turn.raw if isinstance(turn.raw, dict) else {"items": turn.items, "status": turn.status, "error": turn.error}
+        item_id, text = extract_latest_agent_message_from_turn(turn_payload)
+        if text and item_id and item_id != thread_state.last_delivered_item_id:
+            return True
+        return bool(
+            turn.turn_id
+            and turn.turn_id != thread_state.last_delivered_turn_id
+            and (turn.status or "") in TERMINAL_TURN_STATUSES - {"completed"}
+        )
+
     async def _start_next_queued_input(self, thread_state: ThreadState) -> None:
         if thread_state.current_turn_id or not thread_state.queued_inputs:
             return
@@ -842,6 +911,7 @@ class BridgeApp:
             return None
 
         first_sent: SentMessage | None = None
+        sent_messages: list[SentMessage] = []
         current_reply_to = reply_to_message_id
         for chunk in render_markdown_chunks(text, self.config.bridge.max_message_chars):
             sent = await self._safe_send_message(
@@ -851,12 +921,18 @@ class BridgeApp:
                 entities=chunk.entities or None,
             )
             if sent is None:
-                return first_sent
+                for partial in reversed(sent_messages):
+                    with contextlib.suppress(Exception):
+                        await self.telegram.delete_message(chat_id=partial.chat_id, message_id=partial.message_id)
+                return None
             if first_sent is None:
                 first_sent = sent
-            self.state.bind_message(chat_id, sent.message_id, thread_state.thread_id)
+            sent_messages.append(sent)
             current_reply_to = sent.message_id
-            thread_state.last_chain_message_id = sent.message_id
+        for sent in sent_messages:
+            self.state.bind_message(chat_id, sent.message_id, thread_state.thread_id)
+        if sent_messages:
+            thread_state.last_chain_message_id = sent_messages[-1].message_id
         return first_sent
 
     async def _safe_send_message(
@@ -921,7 +997,7 @@ class BridgeApp:
             return None
         command, _, remainder = stripped.partition(" ")
         normalized = command.lower().removeprefix("/")
-        if normalized != "attach":
+        if normalized not in {"attach", "detach"}:
             return None
         argument = remainder.strip() or None
         return normalized, argument
@@ -944,8 +1020,8 @@ class BridgeApp:
         return None
 
     def _next_callback_key(self) -> str:
-        self._next_approval_key += 1
-        return str(self._next_approval_key)
+        self.state.next_callback_key += 1
+        return str(self.state.next_callback_key)
 
     def _format_desktop_request_prompt(self, request: DesktopRequest) -> str:
         kind = request.kind.lower()
@@ -1016,10 +1092,17 @@ class BridgeApp:
 
     def _format_attach_button_text(self, thread: DesktopConversationSummary) -> str:
         project = (thread.project_label or "project").strip()
-        title = (thread.title or thread.thread_id).strip()
+        title = (thread.title or "").strip()
+        if not title:
+            title = self._untitled_attach_label(thread)
         if len(title) > 36:
             title = f"{title[:33]}..."
         return f"{project}: {title}"
+
+    def _untitled_attach_label(self, thread: DesktopConversationSummary) -> str:
+        if thread.updated_at is None:
+            return "Untitled session"
+        return f"Untitled {thread.updated_at:%H:%M}"
 
     async def _clear_project_selection(self, pending: PendingProjectSelection, *, delete_message: bool) -> None:
         if delete_message:
