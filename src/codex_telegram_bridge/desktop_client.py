@@ -312,13 +312,37 @@ class CodexDesktopClient:
             await asyncio.sleep(self._poll_interval_seconds)
         raise DesktopClientError(f"Desktop did not create a new turn for thread {thread_id}.")
 
-    async def click_approval_action(self, thread_id: str, *, approve: bool) -> None:
+    async def click_approval_action(
+        self,
+        thread_id: str,
+        *,
+        approve: bool,
+        labels: list[str] | None = None,
+    ) -> None:
         await self.activate_thread(thread_id)
-        labels = ["Approve", "Accept", "Allow"] if approve else ["Deny", "Decline"]
-        result = await self._eval_json(_click_text_button_js(labels))
-        if not result or not result.get("ok"):
-            action = "approve" if approve else "deny"
-            raise DesktopClientError(f"Desktop did not expose a visible {action} button for thread {thread_id}.")
+        candidate_labels = _merge_button_labels(
+            labels,
+            ["Approve", "Accept", "Allow"] if approve else ["Deny", "Decline"],
+        )
+        deadline = asyncio.get_running_loop().time() + self._launch_timeout_seconds
+        last_visible_buttons: list[str] = []
+        while True:
+            result = await self._eval_json(_click_text_button_js(candidate_labels))
+            if result and result.get("ok"):
+                return
+            if isinstance(result, dict):
+                visible_buttons = result.get("visibleButtons")
+                if isinstance(visible_buttons, list):
+                    last_visible_buttons = [str(label) for label in visible_buttons if isinstance(label, str)]
+            if asyncio.get_running_loop().time() > deadline:
+                break
+            await asyncio.sleep(self._poll_interval_seconds)
+
+        action = "approve" if approve else "deny"
+        detail = ""
+        if last_visible_buttons:
+            detail = f" Visible buttons: {', '.join(last_visible_buttons)}."
+        raise DesktopClientError(f"Desktop did not expose a visible {action} button for thread {thread_id}.{detail}")
 
     async def _focus_composer(self) -> None:
         focused = await self._eval_json(_FOCUS_COMPOSER_JS)
@@ -597,6 +621,18 @@ def _coerce_datetime_optional(value: Any) -> datetime | None:
     except (TypeError, ValueError):
         return None
     return datetime.fromtimestamp(timestamp_ms / 1000)
+
+
+def _merge_button_labels(custom_labels: list[str] | None, default_labels: list[str]) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for label in [*(custom_labels or []), *default_labels]:
+        normalized = label.casefold().strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        merged.append(label)
+    return merged
 
 
 def _conversation_has_user_message(
@@ -1026,14 +1062,40 @@ def _project_button_center_js(project_path: str) -> str:
 def _click_text_button_js(labels: list[str]) -> str:
     return f"""
 (() => {{
-  const labels = {_quote_json(labels)};
-  const button = [...document.querySelectorAll('button')].find((node) => {{
-    const text = (node.innerText || node.textContent || '').trim();
-    const aria = (node.getAttribute('aria-label') || '').trim();
-    return labels.includes(text) || labels.includes(aria);
+  const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+  const labels = {_quote_json(labels)}
+    .map((value) => normalize(value))
+    .filter(Boolean);
+  const labelMatches = (candidate, label) =>
+    candidate === label || candidate.startsWith(`${{label}} `) || candidate.startsWith(`${{label}}\\n`);
+
+  const buttonEntries = [...document.querySelectorAll('button')].map((node) => {{
+    const rect = node.getBoundingClientRect();
+    const visible = rect.width > 0 && rect.height > 0 && !node.disabled && node.getAttribute('aria-hidden') !== 'true';
+    const rawLabels = [
+      node.innerText || '',
+      node.textContent || '',
+      node.getAttribute('aria-label') || '',
+      node.getAttribute('title') || '',
+    ]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+    const normalizedLabels = [...new Set(rawLabels.map((value) => normalize(value)).filter(Boolean))];
+    return {{ node, visible, rawLabels, normalizedLabels }};
   }});
-  if (!button) return {{ ok: false }};
-  button.click();
+
+  const button = buttonEntries.find((entry) =>
+    entry.visible && entry.normalizedLabels.some((candidate) => labels.some((label) => labelMatches(candidate, label)))
+  );
+  if (!button) {{
+    const visibleButtons = [...new Set(
+      buttonEntries
+        .filter((entry) => entry.visible)
+        .flatMap((entry) => entry.rawLabels)
+    )];
+    return {{ ok: false, visibleButtons }};
+  }}
+  button.node.click();
   return {{ ok: true }};
 }})()
 """

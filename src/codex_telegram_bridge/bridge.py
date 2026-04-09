@@ -31,6 +31,8 @@ class PendingApproval:
     thread_id: str
     chat_id: int
     message_id: int
+    approve_labels: tuple[str, ...] = ()
+    deny_labels: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -431,7 +433,11 @@ class BridgeApp:
 
         approve = action == "approve"
         try:
-            await self.desktop.click_approval_action(pending.thread_id, approve=approve)
+            await self.desktop.click_approval_action(
+                pending.thread_id,
+                approve=approve,
+                labels=list(pending.approve_labels if approve else pending.deny_labels) or None,
+            )
         except DesktopClientError:
             logger.exception("Failed responding to approval %s", pending.request_id)
             await self.telegram.answer_callback_query(callback_id, text="Failed to answer approval")
@@ -779,6 +785,8 @@ class BridgeApp:
             thread_id=thread_state.thread_id,
             chat_id=sent.chat_id,
             message_id=sent.message_id,
+            approve_labels=tuple(self._approval_button_labels(request, approve=True)),
+            deny_labels=tuple(self._approval_button_labels(request, approve=False)),
         )
         self._pending_approvals[callback_key] = pending
         self.state.approval_cleanup_messages.append(
@@ -952,7 +960,24 @@ class BridgeApp:
                 entities=entities,
                 inline_keyboard=inline_keyboard,
             )
-        except TelegramApiError:
+        except TelegramApiError as exc:
+            if reply_to_message_id is not None and self._is_missing_reply_target_error(exc):
+                logger.warning(
+                    "Telegram reply target %s/%s is no longer available; explaining the failure instead of retrying",
+                    chat_id,
+                    reply_to_message_id,
+                )
+                try:
+                    await self.telegram.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            "Failed to send a reply because the referenced Telegram message is no longer available. "
+                            "Reply to a newer bridge message or send a new top-level message."
+                        ),
+                    )
+                except TelegramApiError:
+                    logger.exception("Telegram sendMessage failed")
+                return None
             logger.exception("Telegram sendMessage failed")
             return None
 
@@ -1045,6 +1070,62 @@ class BridgeApp:
         if cwd:
             lines.append(f"CWD: {cwd}")
         return "\n".join(lines).strip()
+
+    def _approval_button_labels(self, request: DesktopRequest, *, approve: bool) -> list[str]:
+        default_labels = ["Approve", "Accept", "Allow"] if approve else ["Deny", "Decline"]
+        if "command" not in request.kind.lower():
+            return default_labels
+
+        labels = list(default_labels)
+        for label in self._extract_command_action_labels(request.raw):
+            if approve and self._looks_like_approve_label(label):
+                labels.append(label)
+            if not approve and self._looks_like_deny_label(label):
+                labels.append(label)
+        return self._dedupe_labels(labels)
+
+    def _extract_command_action_labels(self, request_payload: dict[str, Any]) -> list[str]:
+        actions = request_payload.get("commandActions")
+        if isinstance(actions, str):
+            return [actions.strip()] if actions.strip() else []
+        if not isinstance(actions, list):
+            return []
+
+        labels: list[str] = []
+        for action in actions:
+            if isinstance(action, str) and action.strip():
+                labels.append(action.strip())
+                continue
+            if not isinstance(action, dict):
+                continue
+            for key in ("label", "title", "text", "name"):
+                value = action.get(key)
+                if isinstance(value, str) and value.strip():
+                    labels.append(value.strip())
+                    break
+        return self._dedupe_labels(labels)
+
+    def _looks_like_approve_label(self, label: str) -> bool:
+        words = set(label.casefold().replace("/", " ").replace("-", " ").split())
+        return bool(words & {"approve", "accept", "allow", "run", "proceed", "continue", "confirm"})
+
+    def _looks_like_deny_label(self, label: str) -> bool:
+        words = set(label.casefold().replace("/", " ").replace("-", " ").split())
+        return bool(words & {"deny", "decline", "reject", "cancel", "abort", "disallow", "block"})
+
+    def _dedupe_labels(self, labels: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for label in labels:
+            normalized = label.casefold().strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append(label)
+        return result
+
+    def _is_missing_reply_target_error(self, exc: TelegramApiError) -> bool:
+        return "message to be replied not found" in str(exc).casefold()
 
     def _remove_pending_message(self, thread_state: ThreadState, message_id: int) -> None:
         thread_state.pending_message_ids = [

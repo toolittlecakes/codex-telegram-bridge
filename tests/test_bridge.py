@@ -84,6 +84,7 @@ class FakeDesktop:
     started_inputs: list[tuple[str, str]] = field(default_factory=list)
     sent_inputs: list[tuple[str, str]] = field(default_factory=list)
     approval_clicks: list[tuple[str, bool]] = field(default_factory=list)
+    approval_click_labels: list[list[str] | None] = field(default_factory=list)
     fail_activate: set[str] = field(default_factory=set)
     fail_start_messages: set[tuple[str, str]] = field(default_factory=set)
     fail_send: set[tuple[str, str]] = field(default_factory=set)
@@ -157,10 +158,17 @@ class FakeDesktop:
         self.threads[thread_id] = copy.deepcopy(cloned)
         return cloned
 
-    async def click_approval_action(self, thread_id: str, *, approve: bool) -> None:
+    async def click_approval_action(
+        self,
+        thread_id: str,
+        *,
+        approve: bool,
+        labels: list[str] | None = None,
+    ) -> None:
         if thread_id in self.fail_approval_threads:
             raise DesktopClientError("approval button missing")
         self.approval_clicks.append((thread_id, approve))
+        self.approval_click_labels.append(labels)
 
 
 @dataclass
@@ -585,7 +593,45 @@ async def test_command_approval_round_trip(app: BridgeApp) -> None:
     )
 
     assert app.desktop.approval_clicks == [("thr_1", True)]
+    assert app.desktop.approval_click_labels == [["Approve", "Accept", "Allow"]]
     assert app.telegram.deleted_messages == [(1234, approval_message_id)]
+
+
+@pytest.mark.asyncio
+async def test_command_approval_uses_desktop_action_labels_from_request(app: BridgeApp) -> None:
+    app.state.primary_chat_id = 1234
+    thread = app.state.get_or_create_thread("thr_1")
+    thread.primary_chat_id = 1234
+    thread.last_chain_message_id = 300
+    app.desktop.threads["thr_1"] = make_conversation(
+        "thr_1",
+        requests=[
+            DesktopRequest(
+                request_id="req_1",
+                kind="command",
+                raw={
+                    "reason": "Needs shell access",
+                    "command": "pytest -q",
+                    "cwd": "/repo",
+                    "commandActions": ["Run command", "Reject"],
+                },
+            )
+        ],
+    )
+
+    await app._sync_thread("thr_1")
+
+    callback_key = next(iter(app._pending_approvals))
+    await app._handle_callback_query(
+        {
+            "id": "cbq-1",
+            "from": {"id": 1, "is_bot": False},
+            "data": f"approve:{callback_key}",
+            "message": {"message_id": 10001, "chat": {"id": 1234, "type": "private"}},
+        }
+    )
+
+    assert app.desktop.approval_click_labels == [["Approve", "Accept", "Allow", "Run command"]]
 
 
 @pytest.mark.asyncio
@@ -1001,6 +1047,43 @@ async def test_telegram_api_uses_http_error_class_when_message_is_empty() -> Non
     await api.close()
 
 
+@pytest.mark.asyncio
+async def test_safe_send_message_explains_missing_reply_target_without_retrying_original(app: BridgeApp) -> None:
+    attempts: list[dict[str, Any]] = []
+
+    async def flaky_send_message(
+        *,
+        chat_id: int,
+        text: str,
+        reply_to_message_id: int | None = None,
+        entities: list[dict[str, Any]] | None = None,
+        inline_keyboard: list[list[dict[str, Any]]] | None = None,
+        disable_notification: bool = False,
+    ):
+        del entities, inline_keyboard, disable_notification
+        attempts.append({"chat_id": chat_id, "text": text, "reply_to_message_id": reply_to_message_id})
+        if len(attempts) == 1:
+            raise TelegramApiError("Bad Request: message to be replied not found (error_code=400, http_status=400)")
+        return type("Sent", (), {"chat_id": chat_id, "message_id": 4242, "raw": {}})
+
+    app.telegram.send_message = flaky_send_message  # type: ignore[method-assign]
+
+    sent = await app._safe_send_message(chat_id=1234, text="hello", reply_to_message_id=999)
+
+    assert sent is None
+    assert attempts == [
+        {"chat_id": 1234, "text": "hello", "reply_to_message_id": 999},
+        {
+            "chat_id": 1234,
+            "text": (
+                "Failed to send a reply because the referenced Telegram message is no longer available. "
+                "Reply to a newer bridge message or send a new top-level message."
+            ),
+            "reply_to_message_id": None,
+        },
+    ]
+
+
 class FakeWs:
     def __init__(
         self,
@@ -1108,6 +1191,29 @@ class SendProbeClient(CodexDesktopClient):
         return {"ok": True}
 
 
+class ApprovalProbeClient(CodexDesktopClient):
+    def __init__(self, *, eval_results: list[dict[str, Any]]) -> None:
+        super().__init__(
+            app_path=Path("/Applications/Codex.app"),
+            remote_debugging_port=9229,
+            user_data_dir=Path("/tmp/codex-telegram-bridge-test"),
+            launch_timeout_seconds=0.02,
+            poll_interval_seconds=0.0,
+        )
+        self.eval_results = list(eval_results)
+        self.activation_calls: list[str] = []
+
+    async def activate_thread(self, thread_id: str) -> DesktopConversation:
+        self.activation_calls.append(thread_id)
+        return make_conversation(thread_id)
+
+    async def _eval_json(self, expression: str) -> dict[str, Any]:
+        del expression
+        if self.eval_results:
+            return self.eval_results.pop(0)
+        return {"ok": True}
+
+
 class StartThreadProbeClient(CodexDesktopClient):
     def __init__(
         self,
@@ -1202,6 +1308,22 @@ async def test_desktop_client_activate_thread_retries_after_expanding_group() ->
 
     assert result.thread_id == "thr_1"
     assert client.prepare_calls == ["thr_1", "thr_1"]
+    await client._http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_desktop_client_click_approval_action_retries_until_button_is_visible() -> None:
+    client = ApprovalProbeClient(
+        eval_results=[
+            {"ok": False, "visibleButtons": ["Later"]},
+            {"ok": True},
+        ]
+    )
+
+    await client.click_approval_action("thr_1", approve=True, labels=["Run command"])
+
+    assert client.activation_calls == ["thr_1"]
+    assert client.eval_results == []
     await client._http.aclose()
 
 
