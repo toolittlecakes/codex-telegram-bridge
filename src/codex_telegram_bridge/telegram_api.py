@@ -8,6 +8,10 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
+LONG_POLL_TIMEOUT_SLACK_SECONDS = 5.0
+
 
 class TelegramApiError(RuntimeError):
     pass
@@ -24,7 +28,9 @@ class TelegramBotApi:
     def __init__(self, bot_token: str, *, base_url: str = "https://api.telegram.org") -> None:
         self._base_url = base_url.rstrip("/")
         self._bot_token = bot_token
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(DEFAULT_REQUEST_TIMEOUT_SECONDS, connect=DEFAULT_CONNECT_TIMEOUT_SECONDS)
+        )
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -41,6 +47,10 @@ class TelegramBotApi:
         timeout: int = 30,
         allowed_updates: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        request_timeout = httpx.Timeout(
+            float(timeout) + LONG_POLL_TIMEOUT_SLACK_SECONDS,
+            connect=DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        )
         result = await self._call(
             "getUpdates",
             {
@@ -48,6 +58,7 @@ class TelegramBotApi:
                 "timeout": timeout,
                 "allowed_updates": allowed_updates or ["message", "callback_query"],
             },
+            timeout=request_timeout,
         )
         assert isinstance(result, list)
         return result
@@ -97,12 +108,19 @@ class TelegramBotApi:
             payload["reaction"] = []
         return bool(await self._call("setMessageReaction", payload))
 
-    async def _call(self, method: str, payload: dict[str, Any]) -> Any:
+    async def _call(
+        self,
+        method: str,
+        payload: dict[str, Any],
+        *,
+        timeout: httpx.Timeout | float | None = None,
+    ) -> Any:
         url = f"{self._base_url}/bot{self._bot_token}/{method}"
         try:
-            response = await self._client.post(url, json=payload)
+            response = await self._client.post(url, json=payload, timeout=timeout)
         except httpx.HTTPError as exc:
-            raise TelegramApiError(f"Telegram API request failed for {method}: {exc}") from exc
+            detail = str(exc).strip() or exc.__class__.__name__
+            raise TelegramApiError(f"Telegram API request failed for {method}: {detail}") from exc
 
         try:
             data = response.json()

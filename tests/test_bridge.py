@@ -942,6 +942,65 @@ async def test_telegram_api_surfaces_json_error_description() -> None:
     await api.close()
 
 
+@pytest.mark.asyncio
+async def test_telegram_api_get_updates_uses_timeout_larger_than_long_poll() -> None:
+    captured_timeout: httpx.Timeout | float | None = None
+
+    class RecordingClient:
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: httpx.Timeout | float | None = None,
+        ) -> httpx.Response:
+            del url, json
+            nonlocal captured_timeout
+            captured_timeout = timeout
+            return httpx.Response(200, json={"ok": True, "result": []})
+
+        async def aclose(self) -> None:
+            return None
+
+    api = TelegramBotApi("token")
+    await api._client.aclose()
+    api._client = RecordingClient()  # type: ignore[assignment]
+
+    updates = await api.get_updates(offset=0, timeout=30)
+
+    assert updates == []
+    assert isinstance(captured_timeout, httpx.Timeout)
+    assert captured_timeout.connect == 10.0
+    assert captured_timeout.read == 35.0
+    await api.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_api_uses_http_error_class_when_message_is_empty() -> None:
+    class FailingClient:
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: httpx.Timeout | float | None = None,
+        ) -> httpx.Response:
+            del url, json, timeout
+            raise httpx.ReadTimeout("")
+
+        async def aclose(self) -> None:
+            return None
+
+    api = TelegramBotApi("token")
+    await api._client.aclose()
+    api._client = FailingClient()  # type: ignore[assignment]
+
+    with pytest.raises(TelegramApiError, match=r"Telegram API request failed for getMe: ReadTimeout"):
+        await api.get_me()
+
+    await api.close()
+
+
 class FakeWs:
     def __init__(
         self,
