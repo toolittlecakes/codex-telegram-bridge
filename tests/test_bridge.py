@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from dataclasses import dataclass, field
@@ -733,6 +734,51 @@ async def test_sync_thread_does_not_echo_telegram_originated_user_message_back_i
     )
 
     await app._sync_thread("thr_1")
+
+    assert app.telegram.sent_messages == []
+    assert thread.last_handled_user_input_key == "turn:turn_2"
+
+
+@pytest.mark.asyncio
+async def test_sync_thread_does_not_echo_telegram_message_during_inflight_send(app: BridgeApp) -> None:
+    app.state.primary_chat_id = 1234
+    thread = app.state.get_or_create_thread("thr_1")
+    thread.primary_chat_id = 1234
+    thread.last_chain_message_id = 200
+    app.state.bind_message(1234, 200, "thr_1")
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    in_progress = make_conversation(
+        "thr_1",
+        title="Thread 1",
+        turns=[make_turn("turn_2", "inProgress", items=[make_user_message_item("follow up")])],
+    )
+    app.desktop.threads["thr_1"] = in_progress
+
+    async def delayed_send_message(thread_id: str, text: str) -> DesktopConversation:
+        assert thread_id == "thr_1"
+        assert text == "follow up"
+        started.set()
+        await release.wait()
+        return in_progress
+
+    app.desktop.send_message = delayed_send_message  # type: ignore[method-assign]
+
+    send_task = asyncio.create_task(
+        app._send_thread_input(
+            thread,
+            text="follow up",
+            source_chat_id=1234,
+            source_message_id=201,
+            bind_on_success=True,
+        )
+    )
+    await started.wait()
+
+    await app._sync_thread("thr_1")
+    release.set()
+    await send_task
 
     assert app.telegram.sent_messages == []
     assert thread.last_handled_user_input_key == "turn:turn_2"

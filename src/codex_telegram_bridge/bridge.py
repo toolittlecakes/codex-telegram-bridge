@@ -96,6 +96,7 @@ class BridgeApp:
         self._pending_attach_selections: dict[str, PendingAttachSelection] = {}
         self._pending_new_thread_replacements: dict[str, PendingNewThreadReplacement] = {}
         self._missing_thread_counts: dict[str, int] = {}
+        self._threads_with_send_in_flight: set[str] = set()
         self._state_lock = asyncio.Lock()
 
     async def run(self) -> None:
@@ -813,6 +814,7 @@ class BridgeApp:
         source_message_id: int,
         bind_on_success: bool = False,
     ) -> None:
+        self._threads_with_send_in_flight.add(thread_state.thread_id)
         try:
             conversation = await self.desktop.send_message(thread_state.thread_id, text)
         except DesktopClientError as exc:
@@ -826,6 +828,8 @@ class BridgeApp:
             )
             await self._save_state()
             return
+        finally:
+            self._threads_with_send_in_flight.discard(thread_state.thread_id)
 
         if bind_on_success:
             self.state.bind_message(source_chat_id, source_message_id, thread_state.thread_id)
@@ -977,6 +981,8 @@ class BridgeApp:
         return changed
 
     async def _sync_latest_user_input(self, thread_state: ThreadState, conversation: DesktopConversation) -> bool:
+        if thread_state.thread_id in self._threads_with_send_in_flight:
+            return False
         key, text = self._latest_user_input_key_and_text(conversation)
         if key is None or text is None:
             return False
