@@ -65,6 +65,15 @@ codex-telegram-bridge run --config ~/.config/codex-telegram-bridge/config.toml
 
 If `telegram.primary_chat_id` is omitted and `bridge.allow_first_private_chat = true`, the first private chat that messages the bot becomes the primary chat.
 
+By default the bridge writes rotating logs to:
+
+```text
+~/.local/state/codex-telegram-bridge/logs/bridge.log
+~/.local/state/codex-telegram-bridge/logs/protocol.log
+```
+
+`bridge.log` is the main operational log. `protocol.log` is the noisy low-level Codex protocol log.
+
 ## Example config
 
 See [`config.example.toml`](./config.example.toml).
@@ -82,6 +91,8 @@ See [`config.example.toml`](./config.example.toml).
 ```bash
 codex-telegram-bridge init-config [--path PATH]
 codex-telegram-bridge run [--config PATH]
+codex-telegram-bridge doctor [--config PATH] [--out PATH]
+codex-telegram-bridge desktop-snapshot [--config PATH] [--out PATH] [--screenshot PATH]
 ```
 
 Telegram control commands:
@@ -101,6 +112,13 @@ Persistent state lives in:
 ~/.local/state/codex-telegram-bridge/state.json
 ```
 
+Rotating logs live in:
+
+```text
+~/.local/state/codex-telegram-bridge/logs/bridge.log
+~/.local/state/codex-telegram-bridge/logs/protocol.log
+```
+
 It stores:
 
 - Telegram update offset
@@ -108,6 +126,21 @@ It stores:
 - Telegram message → Desktop thread bindings
 - last delivered thread items
 - queued user inputs
+
+## Logging
+
+- The bridge does not log to the terminal by default.
+- `bridge.log` contains normal lifecycle events, warnings, and exceptions.
+- `protocol.log` contains low-level Codex app-server protocol traffic and stderr diagnostics.
+- Both logs rotate by size. The defaults are `10 MiB` per file and `7` retained backups.
+- Set `bridge.console_log = true` only when you explicitly want foreground console logging.
+
+Useful commands:
+
+```bash
+tail -f ~/.local/state/codex-telegram-bridge/logs/bridge.log
+tail -f ~/.local/state/codex-telegram-bridge/logs/protocol.log
+```
 
 ## Limitations
 
@@ -124,6 +157,22 @@ Run tests:
 
 ```bash
 uv run pytest
+```
+
+Machine-readable diagnostics:
+
+```bash
+codex-telegram-bridge doctor --config ./config.example.toml
+codex-telegram-bridge desktop-snapshot --config ./config.example.toml --screenshot ./desktop.png
+```
+
+Local e2e harness:
+
+```bash
+uv run tests/e2e/run_smoke.py start --config ./config.e2e.toml
+uv run tests/e2e/run_smoke.py plan --config ./config.e2e.toml
+uv run tests/e2e/run_smoke.py assert startup --config ./config.e2e.toml
+uv run tests/e2e/run_smoke.py stop
 ```
 
 Run locally without installing:

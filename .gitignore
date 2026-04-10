@@ -11,3 +11,8 @@ dist/
 .env
 *.log
 .DS_Store
+.e2e/
+artifacts/
+screenshots/
+tests/e2e/.sessions/
+tests/e2e/.state/

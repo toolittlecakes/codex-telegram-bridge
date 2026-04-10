@@ -11,6 +11,12 @@ DEFAULT_CONFIG_PATH = Path.home() / ".config" / "codex-telegram-bridge" / "confi
 DEFAULT_STATE_PATH = Path.home() / ".local" / "state" / "codex-telegram-bridge" / "state.json"
 DEFAULT_DESKTOP_APP_PATH = Path("/Applications/Codex.app")
 DEFAULT_DESKTOP_USER_DATA_DIR = Path.home() / "Library" / "Application Support" / "com.openai.chat"
+DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_LOG_BACKUP_COUNT = 7
+
+
+def default_log_dir(state_path: Path) -> Path:
+    return state_path.parent / "logs"
 
 
 @dataclass(slots=True)
@@ -39,6 +45,18 @@ class BridgeConfig:
     allow_first_private_chat: bool = True
     max_message_chars: int = 3900
     log_level: str = "INFO"
+    protocol_log_level: str = "DEBUG"
+    log_path: Path | None = None
+    protocol_log_path: Path | None = None
+    console_log: bool = False
+    log_max_bytes: int = DEFAULT_LOG_MAX_BYTES
+    log_backup_count: int = DEFAULT_LOG_BACKUP_COUNT
+
+    def __post_init__(self) -> None:
+        if self.log_path is None:
+            self.log_path = default_log_dir(self.state_path) / "bridge.log"
+        if self.protocol_log_path is None:
+            self.protocol_log_path = default_log_dir(self.state_path) / "protocol.log"
 
 
 @dataclass(slots=True)
@@ -83,11 +101,19 @@ def load_config(path: Path | None) -> AppConfig:
     )
 
     bridge_raw = dict(raw.get("bridge") or {})
+    state_path = _expand_path(bridge_raw.get("state_path", DEFAULT_STATE_PATH))
+    log_dir = default_log_dir(state_path)
     bridge = BridgeConfig(
-        state_path=_expand_path(bridge_raw.get("state_path", DEFAULT_STATE_PATH)),
+        state_path=state_path,
         allow_first_private_chat=bool(bridge_raw.get("allow_first_private_chat", True)),
         max_message_chars=int(bridge_raw.get("max_message_chars", 3900)),
         log_level=str(bridge_raw.get("log_level", "INFO")).upper(),
+        protocol_log_level=str(bridge_raw.get("protocol_log_level", "DEBUG")).upper(),
+        log_path=_expand_path(bridge_raw.get("log_path", log_dir / "bridge.log")),
+        protocol_log_path=_expand_path(bridge_raw.get("protocol_log_path", log_dir / "protocol.log")),
+        console_log=bool(bridge_raw.get("console_log", False)),
+        log_max_bytes=int(bridge_raw.get("log_max_bytes", DEFAULT_LOG_MAX_BYTES)),
+        log_backup_count=int(bridge_raw.get("log_backup_count", DEFAULT_LOG_BACKUP_COUNT)),
     )
 
     return AppConfig(telegram=telegram, desktop=desktop, bridge=bridge)
@@ -95,6 +121,8 @@ def load_config(path: Path | None) -> AppConfig:
 
 def ensure_parent_dirs(config: AppConfig) -> None:
     config.bridge.state_path.parent.mkdir(parents=True, exist_ok=True)
+    config.bridge.log_path.parent.mkdir(parents=True, exist_ok=True)
+    config.bridge.protocol_log_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 EXAMPLE_CONFIG = """# Telegram bot settings.
@@ -120,6 +148,12 @@ state_path = "~/.local/state/codex-telegram-bridge/state.json"
 allow_first_private_chat = true
 max_message_chars = 3900
 log_level = "INFO"
+protocol_log_level = "DEBUG"
+log_path = "~/.local/state/codex-telegram-bridge/logs/bridge.log"
+protocol_log_path = "~/.local/state/codex-telegram-bridge/logs/protocol.log"
+console_log = false
+log_max_bytes = 10485760
+log_backup_count = 7
 """
 
 

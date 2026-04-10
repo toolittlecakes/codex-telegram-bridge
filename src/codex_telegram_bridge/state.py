@@ -21,6 +21,7 @@ class ThreadState:
     last_chain_message_id: int | None = None
     last_delivered_turn_id: str | None = None
     last_delivered_item_id: str | None = None
+    last_handled_user_input_key: str | None = None
     current_turn_id: str | None = None
     pending_message_ids: list[int] = field(default_factory=list)
     queued_inputs: list[QueuedInput] = field(default_factory=list)
@@ -35,7 +36,7 @@ class ApprovalCleanupMessage:
 
 @dataclass(slots=True)
 class BridgeState:
-    version: int = 2
+    version: int = 3
     telegram_update_offset: int = 0
     next_callback_key: int = 0
     primary_chat_id: int | None = None
@@ -57,6 +58,7 @@ class BridgeState:
                 last_chain_message_id=thread_raw.get("last_chain_message_id"),
                 last_delivered_turn_id=thread_raw.get("last_delivered_turn_id"),
                 last_delivered_item_id=thread_raw.get("last_delivered_item_id"),
+                last_handled_user_input_key=thread_raw.get("last_handled_user_input_key"),
                 current_turn_id=thread_raw.get("current_turn_id"),
                 pending_message_ids=list(thread_raw.get("pending_message_ids", [])),
                 queued_inputs=queued,
@@ -86,6 +88,7 @@ class BridgeState:
                     "last_chain_message_id": state.last_chain_message_id,
                     "last_delivered_turn_id": state.last_delivered_turn_id,
                     "last_delivered_item_id": state.last_delivered_item_id,
+                    "last_handled_user_input_key": state.last_handled_user_input_key,
                     "current_turn_id": state.current_turn_id,
                     "pending_message_ids": state.pending_message_ids,
                     "queued_inputs": [asdict(item) for item in state.queued_inputs],

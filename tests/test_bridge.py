@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -18,6 +19,7 @@ from codex_telegram_bridge.cli import SingleInstanceError, _hold_single_instance
 from codex_telegram_bridge.config import AppConfig, BridgeConfig, DesktopConfig, TelegramConfig, load_config
 from codex_telegram_bridge.desktop_client import (
     DesktopClientError,
+    DesktopDraftConflictError,
     CodexDesktopClient,
     DesktopConversation,
     DesktopConversationSummary,
@@ -25,6 +27,12 @@ from codex_telegram_bridge.desktop_client import (
     DesktopRequest,
     DesktopSessionInfo,
     DesktopTurn,
+    _COMPOSER_STATE_JS,
+    _CURRENT_THREAD_ID_JS,
+    _FOCUS_COMPOSER_JS,
+    _THREAD_HEADER_TITLE_JS,
+    _click_send_button_js,
+    _project_button_center_js,
 )
 from codex_telegram_bridge.formatting import render_markdown_chunks
 from codex_telegram_bridge.state import ApprovalCleanupMessage, BridgeState, QueuedInput
@@ -85,10 +93,12 @@ class FakeDesktop:
     sent_inputs: list[tuple[str, str]] = field(default_factory=list)
     approval_clicks: list[tuple[str, bool]] = field(default_factory=list)
     approval_click_labels: list[list[str] | None] = field(default_factory=list)
+    start_replace_flags: list[bool] = field(default_factory=list)
     fail_activate: set[str] = field(default_factory=set)
     fail_start_messages: set[tuple[str, str]] = field(default_factory=set)
     fail_send: set[tuple[str, str]] = field(default_factory=set)
     fail_approval_threads: set[str] = field(default_factory=set)
+    draft_conflicts: dict[tuple[str, str], str] = field(default_factory=dict)
     start_calls: int = 0
 
     async def start(self) -> DesktopSessionInfo:  # pragma: no cover - not used in tests
@@ -125,8 +135,17 @@ class FakeDesktop:
         conversation = self.threads.get(thread_id)
         return copy.deepcopy(conversation) if conversation is not None else None
 
-    async def start_new_thread(self, project_path: str, text: str) -> DesktopConversation:
+    async def start_new_thread(
+        self,
+        project_path: str,
+        text: str,
+        *,
+        replace_existing_draft: bool = False,
+    ) -> DesktopConversation:
         key = (project_path, text)
+        self.start_replace_flags.append(replace_existing_draft)
+        if key in self.draft_conflicts and not replace_existing_draft:
+            raise DesktopDraftConflictError(context="a new thread", draft_text=self.draft_conflicts[key])
         if key in self.fail_start_messages:
             raise DesktopClientError("start failed")
         self.started_inputs.append(key)
@@ -339,6 +358,141 @@ async def test_project_selection_starts_thread_and_turn(app: BridgeApp) -> None:
 
 
 @pytest.mark.asyncio
+async def test_project_selection_prompts_for_replace_when_new_chat_contains_draft(app: BridgeApp) -> None:
+    app.desktop.draft_conflicts[("/repo", "hello")] = "current text"
+
+    await app._process_telegram_update(
+        {
+            "message": {
+                "message_id": 111,
+                "chat": {"id": 1234, "type": "private"},
+                "from": {"id": 1, "is_bot": False},
+                "text": "hello",
+            }
+        }
+    )
+
+    await app._handle_callback_query(
+        {
+            "id": "cbq-1",
+            "from": {"id": 1, "is_bot": False},
+            "data": "project:1:0",
+            "message": {"message_id": 10001, "chat": {"id": 1234, "type": "private"}},
+        }
+    )
+
+    assert app.desktop.started_inputs == []
+    assert app.state.lookup_thread_for_message(1234, 111) is None
+    assert app.telegram.deleted_messages == [(1234, 10001)]
+    assert len(app._pending_new_thread_replacements) == 1
+    prompt = app.telegram.sent_messages[-1]
+    assert prompt["chat_id"] == 1234
+    assert prompt["text"] == (
+        "This project's new chat window already contains a draft:\n\n"
+        "Current text:\ncurrent text\n\n"
+        "Replace it with your new message?"
+    )
+    assert prompt["reply_to_message_id"] == 111
+    assert prompt["disable_notification"] is False
+    assert prompt["entities"] is not None
+    assert len(prompt["entities"]) == 1
+    assert prompt["entities"][0]["type"] == "pre"
+    assert prompt["entities"][0]["length"] == 12
+    assert prompt["inline_keyboard"] == [
+        [
+            {"text": "Replace", "callback_data": "new-thread-replace:2"},
+            {"text": "Cancel", "callback_data": "new-thread-replace-cancel:2"},
+        ]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_new_thread_replace_callback_deletes_prompt_and_retries_with_replace(app: BridgeApp) -> None:
+    app.desktop.draft_conflicts[("/repo", "hello")] = "current text"
+    app.desktop.new_thread_results[("/repo", "hello")] = make_conversation(
+        "thr_1",
+        title="Thread 1",
+        turns=[make_turn("turn_1", "inProgress")],
+    )
+
+    await app._process_telegram_update(
+        {
+            "message": {
+                "message_id": 111,
+                "chat": {"id": 1234, "type": "private"},
+                "from": {"id": 1, "is_bot": False},
+                "text": "hello",
+            }
+        }
+    )
+    await app._handle_callback_query(
+        {
+            "id": "cbq-1",
+            "from": {"id": 1, "is_bot": False},
+            "data": "project:1:0",
+            "message": {"message_id": 10001, "chat": {"id": 1234, "type": "private"}},
+        }
+    )
+
+    callback_key = next(iter(app._pending_new_thread_replacements))
+    await app._handle_callback_query(
+        {
+            "id": "cbq-2",
+            "from": {"id": 1, "is_bot": False},
+            "data": f"new-thread-replace:{callback_key}",
+            "message": {"message_id": 10002, "chat": {"id": 1234, "type": "private"}},
+        }
+    )
+
+    assert app.desktop.start_replace_flags == [False, True]
+    assert app.desktop.started_inputs == [("/repo", "hello")]
+    assert app.telegram.deleted_messages == [(1234, 10001), (1234, 10002)]
+    assert app.state.lookup_thread_for_message(1234, 111) == "thr_1"
+    assert app.state.threads["thr_1"].current_turn_id == "turn_1"
+    assert app.telegram.reactions == [(1234, 111, "👀")]
+
+
+@pytest.mark.asyncio
+async def test_new_thread_replace_cancel_deletes_prompt_without_retry(app: BridgeApp) -> None:
+    app.desktop.draft_conflicts[("/repo", "hello")] = "current text"
+
+    await app._process_telegram_update(
+        {
+            "message": {
+                "message_id": 111,
+                "chat": {"id": 1234, "type": "private"},
+                "from": {"id": 1, "is_bot": False},
+                "text": "hello",
+            }
+        }
+    )
+    await app._handle_callback_query(
+        {
+            "id": "cbq-1",
+            "from": {"id": 1, "is_bot": False},
+            "data": "project:1:0",
+            "message": {"message_id": 10001, "chat": {"id": 1234, "type": "private"}},
+        }
+    )
+
+    callback_key = next(iter(app._pending_new_thread_replacements))
+    await app._handle_callback_query(
+        {
+            "id": "cbq-2",
+            "from": {"id": 1, "is_bot": False},
+            "data": f"new-thread-replace-cancel:{callback_key}",
+            "message": {"message_id": 10002, "chat": {"id": 1234, "type": "private"}},
+        }
+    )
+
+    assert app.desktop.start_replace_flags == [False]
+    assert app.desktop.started_inputs == []
+    assert app.telegram.deleted_messages == [(1234, 10001), (1234, 10002)]
+    assert app.state.lookup_thread_for_message(1234, 111) is None
+    assert app._pending_new_thread_replacements == {}
+
+
+@pytest.mark.asyncio
 async def test_reply_routes_back_to_existing_thread_and_queues_while_busy(app: BridgeApp) -> None:
     app.state.primary_chat_id = 1234
     thread = app.state.get_or_create_thread("thr_1")
@@ -518,6 +672,125 @@ async def test_sync_thread_delivers_completion_and_starts_queued_input(app: Brid
 
 
 @pytest.mark.asyncio
+async def test_sync_thread_mirrors_codex_side_user_message_into_telegram(app: BridgeApp) -> None:
+    app.state.primary_chat_id = 1234
+    thread = app.state.get_or_create_thread("thr_1")
+    thread.primary_chat_id = 1234
+    thread.last_chain_message_id = 111
+    thread.last_handled_user_input_key = "turn:turn_1"
+    app.desktop.threads["thr_1"] = make_conversation(
+        "thr_1",
+        title="Thread 1",
+        turns=[
+            make_turn("turn_1", "completed", items=[make_user_message_item("old")]),
+            make_turn("turn_2", "inProgress", items=[make_user_message_item("written in codex")]),
+        ],
+    )
+
+    await app._sync_thread("thr_1")
+
+    assert app.telegram.sent_messages == [
+        {
+            "chat_id": 1234,
+            "text": "written in codex",
+            "reply_to_message_id": 111,
+            "entities": None,
+            "inline_keyboard": None,
+            "disable_notification": False,
+        }
+    ]
+    assert thread.last_handled_user_input_key == "turn:turn_2"
+    assert thread.last_chain_message_id == 10001
+    assert app.state.lookup_thread_for_message(1234, 10001) == "thr_1"
+
+
+@pytest.mark.asyncio
+async def test_sync_thread_does_not_echo_telegram_originated_user_message_back_into_telegram(app: BridgeApp) -> None:
+    app.state.primary_chat_id = 1234
+    thread = app.state.get_or_create_thread("thr_1")
+    thread.primary_chat_id = 1234
+    thread.last_chain_message_id = 200
+    app.state.bind_message(1234, 200, "thr_1")
+    app.desktop.threads["thr_1"] = make_conversation("thr_1", title="Thread 1")
+    in_progress = make_conversation(
+        "thr_1",
+        title="Thread 1",
+        turns=[make_turn("turn_2", "inProgress", items=[make_user_message_item("follow up")])],
+    )
+    app.desktop.send_results[("thr_1", "follow up")] = in_progress
+    app.desktop.threads["thr_1"] = in_progress
+
+    await app._process_telegram_update(
+        {
+            "message": {
+                "message_id": 201,
+                "chat": {"id": 1234, "type": "private"},
+                "from": {"id": 1, "is_bot": False},
+                "text": "follow up",
+                "reply_to_message": {"message_id": 200},
+            }
+        }
+    )
+
+    await app._sync_thread("thr_1")
+
+    assert app.telegram.sent_messages == []
+    assert thread.last_handled_user_input_key == "turn:turn_2"
+
+
+@pytest.mark.asyncio
+async def test_sync_thread_delivers_completion_after_restart_when_pending_reply_target_is_missing(app: BridgeApp) -> None:
+    app.state.primary_chat_id = 1234
+    thread = app.state.get_or_create_thread("thr_1")
+    thread.primary_chat_id = 1234
+    thread.pending_message_ids = [51]
+    thread.last_chain_message_id = 116
+    app.desktop.threads["thr_1"] = make_conversation(
+        "thr_1",
+        title="Thread 1",
+        turns=[
+            make_turn(
+                "turn_1",
+                "completed",
+                items=[{"id": "item_1", "type": "agentMessage", "text": "Recovered after restart."}],
+            )
+        ],
+    )
+
+    attempts: list[dict[str, Any]] = []
+
+    async def flaky_send_message(
+        *,
+        chat_id: int,
+        text: str,
+        reply_to_message_id: int | None = None,
+        entities: list[dict[str, Any]] | None = None,
+        inline_keyboard: list[list[dict[str, Any]]] | None = None,
+        disable_notification: bool = False,
+    ):
+        del entities, inline_keyboard, disable_notification
+        attempts.append({"chat_id": chat_id, "text": text, "reply_to_message_id": reply_to_message_id})
+        if len(attempts) == 1:
+            raise TelegramApiError("Bad Request: message to be replied not found (error_code=400, http_status=400)")
+        return type("Sent", (), {"chat_id": chat_id, "message_id": 4242, "raw": {}})
+
+    app.telegram.send_message = flaky_send_message  # type: ignore[method-assign]
+
+    await app._sync_thread("thr_1")
+
+    assert attempts == [
+        {"chat_id": 1234, "text": "Recovered after restart.", "reply_to_message_id": 51},
+        {"chat_id": 1234, "text": "Recovered after restart.", "reply_to_message_id": 116},
+    ]
+    assert app.telegram.reactions == [(1234, 51, "👌")]
+    assert thread.last_delivered_item_id == "item_1"
+    assert thread.last_delivered_turn_id == "turn_1"
+    assert thread.pending_message_ids == []
+    assert thread.last_chain_message_id == 4242
+    assert app.state.lookup_thread_for_message(1234, 4242) == "thr_1"
+
+
+@pytest.mark.asyncio
 async def test_sync_thread_does_not_advance_when_multi_chunk_delivery_fails(app: BridgeApp) -> None:
     app.config.bridge.max_message_chars = 12
     app.telegram.fail_send_calls = {2}
@@ -595,6 +868,7 @@ async def test_command_approval_round_trip(app: BridgeApp) -> None:
     assert app.desktop.approval_clicks == [("thr_1", True)]
     assert app.desktop.approval_click_labels == [["Approve", "Accept", "Allow"]]
     assert app.telegram.deleted_messages == [(1234, approval_message_id)]
+    assert app.state.threads["thr_1"].last_chain_message_id == 300
 
 
 @pytest.mark.asyncio
@@ -632,6 +906,130 @@ async def test_command_approval_uses_desktop_action_labels_from_request(app: Bri
     )
 
     assert app.desktop.approval_click_labels == [["Approve", "Accept", "Allow", "Run command"]]
+
+
+@pytest.mark.asyncio
+async def test_command_approval_uses_available_decision_labels_for_accept(app: BridgeApp) -> None:
+    app.state.primary_chat_id = 1234
+    thread = app.state.get_or_create_thread("thr_1")
+    thread.primary_chat_id = 1234
+    thread.last_chain_message_id = 300
+    app.desktop.threads["thr_1"] = make_conversation(
+        "thr_1",
+        requests=[
+            DesktopRequest(
+                request_id="req_1",
+                kind="command",
+                raw={
+                    "params": {
+                        "availableDecisions": ["accept", "cancel"],
+                    }
+                },
+            )
+        ],
+    )
+
+    await app._sync_thread("thr_1")
+
+    callback_key = next(iter(app._pending_approvals))
+    await app._handle_callback_query(
+        {
+            "id": "cbq-1",
+            "from": {"id": 1, "is_bot": False},
+            "data": f"approve:{callback_key}",
+            "message": {"message_id": 10001, "chat": {"id": 1234, "type": "private"}},
+        }
+    )
+
+    assert app.desktop.approval_click_labels == [["Approve", "Accept", "Allow", "Yes"]]
+
+
+@pytest.mark.asyncio
+async def test_command_approval_uses_available_decision_labels_for_cancel(app: BridgeApp) -> None:
+    app.state.primary_chat_id = 1234
+    thread = app.state.get_or_create_thread("thr_1")
+    thread.primary_chat_id = 1234
+    thread.last_chain_message_id = 300
+    app.desktop.threads["thr_1"] = make_conversation(
+        "thr_1",
+        requests=[
+            DesktopRequest(
+                request_id="req_1",
+                kind="command",
+                raw={
+                    "params": {
+                        "availableDecisions": ["accept", "cancel"],
+                    }
+                },
+            )
+        ],
+    )
+
+    await app._sync_thread("thr_1")
+
+    callback_key = next(iter(app._pending_approvals))
+    await app._handle_callback_query(
+        {
+            "id": "cbq-1",
+            "from": {"id": 1, "is_bot": False},
+            "data": f"deny:{callback_key}",
+            "message": {"message_id": 10001, "chat": {"id": 1234, "type": "private"}},
+        }
+    )
+
+    assert app.desktop.approval_click_labels == [["Deny", "Decline", "Skip", "Cancel", "No"]]
+
+
+@pytest.mark.asyncio
+async def test_stale_callback_query_does_not_abort_processing_when_answer_fails(app: BridgeApp) -> None:
+    app.telegram.answer_callback_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=TelegramApiError(
+            "Bad Request: query is too old and response timeout expired or query ID is invalid "
+            "(error_code=400, http_status=400)"
+        )
+    )
+
+    await app._handle_callback_query(
+        {
+            "id": "cbq-stale",
+            "from": {"id": 1, "is_bot": False},
+            "data": "approve:missing",
+            "message": {"message_id": 10001, "chat": {"id": 1234, "type": "private"}},
+        }
+    )
+
+    assert app.telegram.deleted_messages == [(1234, 10001)]
+
+
+@pytest.mark.asyncio
+async def test_telegram_updates_loop_advances_offset_for_stale_callback_query(app: BridgeApp) -> None:
+    update = {
+        "update_id": 42,
+        "callback_query": {
+            "id": "cbq-stale",
+            "from": {"id": 1, "is_bot": False},
+            "data": "approve:missing",
+            "message": {"message_id": 10001, "chat": {"id": 1234, "type": "private"}},
+        },
+    }
+
+    async def fake_get_updates(*, offset: int, timeout: int = 30, allowed_updates: list[str] | None = None):
+        del timeout, allowed_updates
+        assert offset == 0
+        app._shutdown.set()
+        return [update]
+
+    app.telegram.get_updates = fake_get_updates  # type: ignore[method-assign]
+    app.telegram.answer_callback_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=TelegramApiError(
+            "Bad Request: query is too old and response timeout expired or query ID is invalid "
+            "(error_code=400, http_status=400)"
+        )
+    )
+
+    await app._telegram_updates_loop()
+
+    assert app.state.telegram_update_offset == 43
 
 
 @pytest.mark.asyncio
@@ -957,6 +1355,18 @@ def test_reset_ephemeral_runtime_state_keeps_cleanup_messages() -> None:
     assert state.next_callback_key == 7
 
 
+def test_bridge_state_round_trips_last_handled_user_input_key(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    state = BridgeState()
+    thread = state.get_or_create_thread("thr_1")
+    thread.last_handled_user_input_key = "turn:turn_2"
+
+    state.save(state_path)
+    loaded = BridgeState.load(state_path)
+
+    assert loaded.threads["thr_1"].last_handled_user_input_key == "turn:turn_2"
+
+
 def test_render_markdown_chunks_does_not_emit_text_link_for_local_file_paths() -> None:
     chunks = render_markdown_chunks(
         "See [bridge.py](/Users/sne/projects/codex-telegram-bridge/src/codex_telegram_bridge/bridge.py#L167).",
@@ -1084,6 +1494,42 @@ async def test_safe_send_message_explains_missing_reply_target_without_retrying_
     ]
 
 
+@pytest.mark.asyncio
+async def test_safe_send_message_retries_missing_reply_target_against_fallback_chain_message(app: BridgeApp) -> None:
+    attempts: list[dict[str, Any]] = []
+
+    async def flaky_send_message(
+        *,
+        chat_id: int,
+        text: str,
+        reply_to_message_id: int | None = None,
+        entities: list[dict[str, Any]] | None = None,
+        inline_keyboard: list[list[dict[str, Any]]] | None = None,
+        disable_notification: bool = False,
+    ):
+        del entities, inline_keyboard, disable_notification
+        attempts.append({"chat_id": chat_id, "text": text, "reply_to_message_id": reply_to_message_id})
+        if len(attempts) == 1:
+            raise TelegramApiError("Bad Request: message to be replied not found (error_code=400, http_status=400)")
+        return type("Sent", (), {"chat_id": chat_id, "message_id": 4242, "raw": {}})
+
+    app.telegram.send_message = flaky_send_message  # type: ignore[method-assign]
+
+    sent = await app._safe_send_message(
+        chat_id=1234,
+        text="hello",
+        reply_to_message_id=999,
+        fallback_reply_to_message_id=1001,
+    )
+
+    assert sent is not None
+    assert sent.message_id == 4242
+    assert attempts == [
+        {"chat_id": 1234, "text": "hello", "reply_to_message_id": 999},
+        {"chat_id": 1234, "text": "hello", "reply_to_message_id": 1001},
+    ]
+
+
 class FakeWs:
     def __init__(
         self,
@@ -1118,6 +1564,7 @@ class ActivationProbeClient(CodexDesktopClient):
         self.thread = make_conversation("thr_1", title="Thread 1")
         self.prepare_results: list[dict[str, Any] | None] = []
         self.current_thread_ids: list[str | None] = []
+        self.header_titles: list[str | None] = []
         self.prepare_calls: list[str] = []
 
     async def _prepare_thread_activation(self, thread_id: str) -> dict[str, Any] | None:
@@ -1136,6 +1583,17 @@ class ActivationProbeClient(CodexDesktopClient):
             return self.current_thread_ids.pop(0)
         return None
 
+    async def _read_thread_header_title(self) -> str | None:
+        if self.header_titles:
+            return self.header_titles.pop(0)
+        return self.thread.title
+
+    async def _eval_json(self, expression: str) -> dict[str, Any]:
+        del expression
+        if self.header_titles:
+            return {"ok": True, "title": self.header_titles.pop(0)}
+        return {"ok": True, "title": self.thread.title}
+
 
 def make_user_message_item(text: str) -> dict[str, Any]:
     return {
@@ -1150,6 +1608,7 @@ class SendProbeClient(CodexDesktopClient):
         read_sequence: list[DesktopConversation],
         *,
         composer_text: str = "",
+        composer_text_sequence: list[str] | None = None,
         eval_results: list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(
@@ -1162,6 +1621,7 @@ class SendProbeClient(CodexDesktopClient):
         self._read_sequence = [copy.deepcopy(item) for item in read_sequence]
         self.inserted_texts: list[str] = []
         self.composer_text = composer_text
+        self.composer_text_sequence = list(composer_text_sequence or [])
         self.eval_results = list(eval_results or [])
 
     async def read_thread(self, thread_id: str) -> DesktopConversation | None:
@@ -1180,10 +1640,13 @@ class SendProbeClient(CodexDesktopClient):
         return None
 
     async def _read_composer_text(self) -> str:
+        if self.composer_text_sequence:
+            return self.composer_text_sequence.pop(0)
         return self.composer_text
 
     async def _insert_text(self, text: str) -> None:
         self.inserted_texts.append(text)
+        self.composer_text = text.rstrip("\n")
 
     async def _eval_json(self, expression: str) -> dict[str, Any]:
         if self.eval_results:
@@ -1214,6 +1677,24 @@ class ApprovalProbeClient(CodexDesktopClient):
         return {"ok": True}
 
 
+class ComposerFocusProbeClient(CodexDesktopClient):
+    def __init__(self, *, eval_results: list[dict[str, Any]]) -> None:
+        super().__init__(
+            app_path=Path("/Applications/Codex.app"),
+            remote_debugging_port=9229,
+            user_data_dir=Path("/tmp/codex-telegram-bridge-test"),
+            launch_timeout_seconds=0.02,
+            poll_interval_seconds=0.0,
+        )
+        self.eval_results = list(eval_results)
+
+    async def _eval_json(self, expression: str) -> dict[str, Any]:
+        del expression
+        if self.eval_results:
+            return self.eval_results.pop(0)
+        return {"ok": True}
+
+
 class StartThreadProbeClient(CodexDesktopClient):
     def __init__(
         self,
@@ -1233,6 +1714,7 @@ class StartThreadProbeClient(CodexDesktopClient):
         self._conversations = {thread_id: copy.deepcopy(conversation) for thread_id, conversation in conversations.items()}
         self.clicked_project_paths: list[str] = []
         self.inserted_texts: list[str] = []
+        self.clear_calls = 0
         self.composer_text = composer_text
 
     async def list_threads(self) -> list[DesktopConversationSummary]:
@@ -1253,11 +1735,16 @@ class StartThreadProbeClient(CodexDesktopClient):
     async def _focus_composer(self) -> None:
         return None
 
+    async def _clear_visible_composer(self) -> None:
+        self.clear_calls += 1
+        self.composer_text = ""
+
     async def _read_composer_text(self) -> str:
         return self.composer_text
 
     async def _insert_text(self, text: str) -> None:
         self.inserted_texts.append(text)
+        self.composer_text = text.rstrip("\n")
 
     async def _eval_json(self, expression: str) -> dict[str, Any]:
         return {"ok": True}
@@ -1312,6 +1799,19 @@ async def test_desktop_client_activate_thread_retries_after_expanding_group() ->
 
 
 @pytest.mark.asyncio
+async def test_desktop_client_activate_thread_waits_for_header_title_to_match_target_conversation() -> None:
+    client = ActivationProbeClient()
+    client.current_thread_ids = ["thr_1", "thr_1"]
+    client.header_titles = ["Wrong thread", "Thread 1"]
+
+    result = await client.activate_thread("thr_1")
+
+    assert result.thread_id == "thr_1"
+    assert client.prepare_calls == ["thr_1", "thr_1"]
+    await client._http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_desktop_client_click_approval_action_retries_until_button_is_visible() -> None:
     client = ApprovalProbeClient(
         eval_results=[
@@ -1323,6 +1823,21 @@ async def test_desktop_client_click_approval_action_retries_until_button_is_visi
     await client.click_approval_action("thr_1", approve=True, labels=["Run command"])
 
     assert client.activation_calls == ["thr_1"]
+    assert client.eval_results == []
+    await client._http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_desktop_client_focus_composer_retries_until_visible_composer_is_focused() -> None:
+    client = ComposerFocusProbeClient(
+        eval_results=[
+            {"ok": False, "error": "composer-not-focused"},
+            {"ok": True},
+        ]
+    )
+
+    await client._focus_composer()
+
     assert client.eval_results == []
     await client._http.aclose()
 
@@ -1389,6 +1904,34 @@ async def test_desktop_client_send_message_fails_when_composer_contains_draft() 
 
 
 @pytest.mark.asyncio
+async def test_desktop_client_send_message_waits_for_transient_composer_draft_to_clear() -> None:
+    before = make_conversation(
+        "thr_1",
+        title="Thread 1",
+        turns=[make_turn("turn_1", "completed", items=[make_user_message_item("old")])],
+    )
+    after = make_conversation(
+        "thr_1",
+        title="Thread 1",
+        turns=[
+            make_turn("turn_1", "completed", items=[make_user_message_item("old")]),
+            make_turn("turn_2", "inProgress", items=[make_user_message_item("probe message")]),
+        ],
+    )
+    client = SendProbeClient(
+        [before, before, after],
+        composer_text_sequence=["transient draft", ""],
+    )
+
+    result = await client.send_message("thr_1", "probe message")
+
+    assert result.latest_turn is not None
+    assert result.latest_turn.turn_id == "turn_2"
+    assert client.inserted_texts == ["probe message\n"]
+    await client._http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_desktop_client_start_new_thread_waits_for_matching_first_user_message() -> None:
     old_summary = DesktopConversationSummary(thread_id="thr_old", title="Old", current=True, cwd="/repo")
     wrong_summary = DesktopConversationSummary(thread_id="thr_wrong", title="Wrong", current=False, cwd="/repo")
@@ -1434,6 +1977,71 @@ async def test_desktop_client_start_new_thread_fails_when_composer_contains_draf
 
     assert client.inserted_texts == []
     await client._http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_desktop_client_start_new_thread_clears_existing_draft_when_replace_is_requested() -> None:
+    old_summary = DesktopConversationSummary(thread_id="thr_old", title="Old", current=True, cwd="/repo")
+    right_summary = DesktopConversationSummary(thread_id="thr_right", title="Right", current=False, cwd="/repo")
+    client = StartThreadProbeClient(
+        list_threads_sequence=[
+            [old_summary],
+            [old_summary, right_summary],
+        ],
+        conversations={
+            "thr_right": make_conversation(
+                "thr_right",
+                title="Right",
+                turns=[make_turn("turn_right", "inProgress", items=[make_user_message_item("hello")])],
+            )
+        },
+        composer_text="unsent desktop draft",
+    )
+
+    result = await client.start_new_thread("/repo", "hello", replace_existing_draft=True)
+
+    assert result.thread_id == "thr_right"
+    assert client.clear_calls == 1
+    assert client.inserted_texts == ["hello\n"]
+    await client._http.aclose()
+
+
+def test_project_button_center_js_matches_current_start_new_chat_button_contract() -> None:
+    expression = _project_button_center_js("/repo")
+
+    assert "aria.startsWith('start new ')" in expression
+    assert "aria.endsWith(expectedSuffix)" in expression
+    assert "Start new thread in" not in expression
+
+
+def test_click_send_button_js_matches_current_composer_panel_contract() -> None:
+    expression = _click_send_button_js()
+
+    assert 'querySelectorAll(\'.ProseMirror[contenteditable="true"]\')' in expression
+    assert 'div[class*="bg-token-input-background"]' in expression
+    assert 'querySelector(\'.ProseMirror[contenteditable="true"]\')' not in expression
+    assert "div.bg-token-input-background" not in expression
+
+
+def test_focus_composer_js_prefers_visible_composer_contract() -> None:
+    assert 'querySelectorAll(\'.ProseMirror[contenteditable="true"]\')' in _FOCUS_COMPOSER_JS
+    assert "no-visible-composer" in _FOCUS_COMPOSER_JS
+    assert "composer-not-focused" in _FOCUS_COMPOSER_JS
+
+
+def test_composer_state_js_prefers_visible_composer_contract() -> None:
+    assert 'querySelectorAll(\'.ProseMirror[contenteditable="true"]\')' in _COMPOSER_STATE_JS
+    assert "no-visible-composer" in _COMPOSER_STATE_JS
+
+
+def test_current_thread_id_js_reads_react_current_conversation_id() -> None:
+    assert "currentConversationId" in _CURRENT_THREAD_ID_JS
+    assert "aria-current" not in _CURRENT_THREAD_ID_JS
+
+
+def test_thread_header_title_js_reads_visible_codex_header_title() -> None:
+    assert "header" in _THREAD_HEADER_TITLE_JS
+    assert ".text-token-foreground" in _THREAD_HEADER_TITLE_JS
 
 
 @pytest.mark.asyncio

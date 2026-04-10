@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -21,6 +22,15 @@ TERMINAL_TURN_STATUSES = {"completed", "failed", "interrupted", "cancelled"}
 
 class DesktopClientError(RuntimeError):
     pass
+
+
+class DesktopDraftConflictError(DesktopClientError):
+    def __init__(self, *, context: str, draft_text: str) -> None:
+        self.context = context
+        self.draft_text = draft_text
+        super().__init__(
+            f"Desktop composer is not empty for {context}. Send or discard the draft in Codex Desktop, then retry."
+        )
 
 
 @dataclass(slots=True)
@@ -209,7 +219,56 @@ class CodexDesktopClient:
             result.append(DesktopProject(label=label.strip(), path=normalized_path))
         return result
 
-    async def start_new_thread(self, project_path: str, text: str) -> DesktopConversation:
+    async def current_thread_id(self) -> str | None:
+        return await self._current_thread_id()
+
+    async def read_composer_state(self) -> dict[str, Any]:
+        payload = await self._eval_json(_COMPOSER_STATE_JS)
+        if not isinstance(payload, dict):
+            return {"ok": False, "text": ""}
+        text = payload.get("text")
+        return {
+            "ok": bool(payload.get("ok")),
+            "text": str(text) if isinstance(text, str) else "",
+        }
+
+    async def list_visible_buttons(self) -> list[str]:
+        payload = await self._eval_json(_VISIBLE_BUTTONS_JS)
+        if not isinstance(payload, dict):
+            return []
+        buttons = payload.get("buttons")
+        if not isinstance(buttons, list):
+            return []
+        return [str(button) for button in buttons if isinstance(button, str)]
+
+    async def snapshot(self) -> dict[str, Any]:
+        current_thread_id = await self.current_thread_id()
+        current_thread = await self.read_thread(current_thread_id) if current_thread_id is not None else None
+        return {
+            "current_thread_id": current_thread_id,
+            "current_thread": current_thread,
+            "threads": await self.list_threads(),
+            "projects": await self.list_projects(),
+            "composer": await self.read_composer_state(),
+            "visible_buttons": await self.list_visible_buttons(),
+        }
+
+    async def capture_screenshot(self, path: Path) -> Path:
+        payload = await self._call_cdp("Page.captureScreenshot", {"format": "png"})
+        data = payload.get("data")
+        if not isinstance(data, str) or not data:
+            raise DesktopClientError("Desktop did not return screenshot bytes.")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(base64.b64decode(data))
+        return path
+
+    async def start_new_thread(
+        self,
+        project_path: str,
+        text: str,
+        *,
+        replace_existing_draft: bool = False,
+    ) -> DesktopConversation:
         before = {thread.thread_id for thread in await self.list_threads()}
         expected_text = text.strip()
         project = await self._project_for_path(project_path)
@@ -219,12 +278,12 @@ class CodexDesktopClient:
         await asyncio.sleep(self._poll_interval_seconds)
         composer_text = await self._read_composer_text()
         if composer_text.strip():
-            raise DesktopClientError(
-                "Desktop composer is not empty for a new thread. "
-                "Send or discard the draft in Codex Desktop, then retry."
-            )
+            if not replace_existing_draft:
+                raise DesktopDraftConflictError(context="a new thread", draft_text=composer_text)
+            await self._clear_visible_composer()
         await self._focus_composer()
         await self._insert_text(text.rstrip() + "\n")
+        await self._wait_for_composer_text(expected_text=expected_text, error_context="a new thread")
         clicked = await self._eval_json(_click_send_button_js())
         if not clicked or not clicked.get("ok"):
             error = clicked.get("error") if isinstance(clicked, dict) else None
@@ -263,7 +322,13 @@ class CodexDesktopClient:
             if conversation is not None:
                 current = await self._current_thread_id()
                 if current == thread_id:
-                    return conversation
+                    header_title = await self._read_thread_header_title()
+                    if _header_matches_conversation(header_title, conversation):
+                        return conversation
+                    if header_title:
+                        last_error = f"header-title-mismatch:{header_title}"
+                    else:
+                        last_error = "missing-thread-header-title"
             if asyncio.get_running_loop().time() > deadline:
                 break
             await asyncio.sleep(self._poll_interval_seconds)
@@ -281,14 +346,10 @@ class CodexDesktopClient:
         _raise_if_thread_turn_is_active(thread_id, baseline)
         before_turn_count = len(baseline.turns)
         expected_text = text.strip()
-        composer_text = await self._read_composer_text()
-        if composer_text.strip():
-            raise DesktopClientError(
-                f"Desktop composer is not empty for thread {thread_id}. "
-                "Send or discard the draft in Codex Desktop, then retry."
-            )
+        await self._wait_for_empty_composer(thread_id)
         await self._focus_composer()
         await self._insert_text(text.rstrip() + "\n")
+        await self._wait_for_composer_text(expected_text=expected_text, error_context=f"thread {thread_id}")
         clicked = await self._eval_json(_click_send_button_js())
         if not clicked or not clicked.get("ok"):
             latest = await self.read_thread(thread_id)
@@ -345,16 +406,91 @@ class CodexDesktopClient:
         raise DesktopClientError(f"Desktop did not expose a visible {action} button for thread {thread_id}.{detail}")
 
     async def _focus_composer(self) -> None:
-        focused = await self._eval_json(_FOCUS_COMPOSER_JS)
-        if not focused or not focused.get("ok"):
-            raise DesktopClientError("Desktop composer is not available.")
+        deadline = asyncio.get_running_loop().time() + self._launch_timeout_seconds
+        last_error = "no-visible-composer"
+        while True:
+            focused = await self._eval_json(_FOCUS_COMPOSER_JS)
+            if isinstance(focused, dict):
+                if focused.get("ok"):
+                    return
+                error = focused.get("error")
+                if isinstance(error, str) and error:
+                    last_error = error
+            if asyncio.get_running_loop().time() > deadline:
+                break
+            await asyncio.sleep(self._poll_interval_seconds)
+        detail = f" ({last_error})" if last_error else ""
+        raise DesktopClientError(f"Desktop composer is not available{detail}.")
+
+    async def _clear_visible_composer(self) -> None:
+        deadline = asyncio.get_running_loop().time() + self._launch_timeout_seconds
+        last_error = "no-visible-composer"
+        while True:
+            result = await self._eval_json(_CLEAR_COMPOSER_JS)
+            if isinstance(result, dict):
+                if result.get("ok"):
+                    composer_text = await self._read_composer_text()
+                    if not composer_text.strip():
+                        return
+                    last_error = "composer-not-cleared"
+                else:
+                    error = result.get("error")
+                    if isinstance(error, str) and error:
+                        last_error = error
+            if asyncio.get_running_loop().time() > deadline:
+                break
+            await asyncio.sleep(self._poll_interval_seconds)
+        detail = f" ({last_error})" if last_error else ""
+        raise DesktopClientError(f"Desktop composer could not be cleared{detail}.")
 
     async def _read_composer_text(self) -> str:
         payload = await self._eval_json(_COMPOSER_STATE_JS)
         if not isinstance(payload, dict) or not payload.get("ok"):
-            raise DesktopClientError("Desktop composer is not available.")
+            error = payload.get("error") if isinstance(payload, dict) else None
+            detail = f" ({error})" if isinstance(error, str) and error else ""
+            raise DesktopClientError(f"Desktop composer is not available{detail}.")
         text = payload.get("text")
         return str(text) if isinstance(text, str) else ""
+
+    async def _read_thread_header_title(self) -> str | None:
+        payload = await self._eval_json(_THREAD_HEADER_TITLE_JS)
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            return None
+        title = payload.get("title")
+        if not isinstance(title, str):
+            return None
+        normalized = title.strip()
+        return normalized or None
+
+    async def _wait_for_empty_composer(self, thread_id: str) -> None:
+        deadline = asyncio.get_running_loop().time() + self._launch_timeout_seconds
+        while True:
+            composer_text = await self._read_composer_text()
+            if not composer_text.strip():
+                return
+            if asyncio.get_running_loop().time() > deadline:
+                break
+            await asyncio.sleep(self._poll_interval_seconds)
+
+        raise DesktopClientError(
+            f"Desktop composer is not empty for thread {thread_id}. "
+            "Send or discard the draft in Codex Desktop, then retry."
+        )
+
+    async def _wait_for_composer_text(self, *, expected_text: str, error_context: str) -> None:
+        normalized_expected = expected_text.strip()
+        deadline = asyncio.get_running_loop().time() + self._launch_timeout_seconds
+        while True:
+            composer_text = await self._read_composer_text()
+            if composer_text.strip() == normalized_expected:
+                return
+            if asyncio.get_running_loop().time() > deadline:
+                break
+            await asyncio.sleep(self._poll_interval_seconds)
+
+        raise DesktopClientError(
+            f"Desktop composer did not accept the expected text for {error_context}."
+        )
 
     async def _prepare_thread_activation(self, thread_id: str) -> dict[str, Any] | None:
         result = await self._eval_json(_prepare_thread_activation_js(thread_id))
@@ -809,35 +945,221 @@ _SIDEBAR_PROJECTS_JS = """
 
 _CURRENT_THREAD_ID_JS = """
 (() => {
-  const row = document.querySelector('[role="button"][aria-current="page"]');
-  if (!row) return { threadId: null };
-  const parent = row.parentElement;
-  const key = parent ? Object.getOwnPropertyNames(parent).find((name) => name.startsWith('__reactProps')) : null;
-  const conversation = key && parent ? parent[key]?.children?.props?.item?.task?.conversation : null;
-  return { threadId: conversation?.id ?? null };
+  const root = document.getElementById('root');
+  const containerKey = root ? Object.getOwnPropertyNames(root).find((name) => name.startsWith('__reactContainer')) : null;
+  const start = containerKey ? root[containerKey] : null;
+  if (!start) return { threadId: null };
+
+  const stack = [start];
+  const seen = new Set();
+
+  while (stack.length) {
+    const fiber = stack.pop();
+    if (!fiber || typeof fiber !== 'object' || seen.has(fiber)) continue;
+    seen.add(fiber);
+
+    const props = fiber.memoizedProps;
+    if (props && typeof props === 'object' && typeof props.currentConversationId === 'string' && props.currentConversationId) {
+      return { threadId: props.currentConversationId };
+    }
+
+    if (fiber.child) stack.push(fiber.child);
+    if (fiber.sibling) stack.push(fiber.sibling);
+  }
+
+  return { threadId: null };
 })()
 """
 
-_FOCUS_COMPOSER_JS = """
-(() => {
-  const composer = document.querySelector('.ProseMirror[contenteditable="true"]');
-  if (!composer) return { ok: false };
+
+def _with_visible_composer_js(body: str) -> str:
+    return f"""
+(() => {{
+  const composerNodes = [...document.querySelectorAll('.ProseMirror[contenteditable="true"]')];
+  const visibleEntries = composerNodes
+    .map((node) => {{
+      const rect = node.getBoundingClientRect();
+      const style = window.getComputedStyle(node);
+      const panel = node.closest('div[class*="bg-token-input-background"]');
+      const panelRect = panel ? panel.getBoundingClientRect() : null;
+      const visible =
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility !== 'hidden' &&
+        style.display !== 'none' &&
+        node.getAttribute('aria-hidden') !== 'true' &&
+        panelRect &&
+        panelRect.width > 0 &&
+        panelRect.height > 0;
+      return {{
+        node,
+        panel,
+        sortRect: panelRect || rect,
+        visible,
+      }};
+    }})
+    .filter((entry) => entry.visible)
+    .sort((left, right) => {{
+      if (right.sortRect.width !== left.sortRect.width) {{
+        return right.sortRect.width - left.sortRect.width;
+      }}
+      if (right.sortRect.y !== left.sortRect.y) {{
+        return right.sortRect.y - left.sortRect.y;
+      }}
+      return right.sortRect.x - left.sortRect.x;
+    }});
+  const composerInfo = visibleEntries[0]
+    ? {{
+        composer: visibleEntries[0].node,
+        panel: visibleEntries[0].panel,
+        composerCount: composerNodes.length,
+        visibleComposerCount: visibleEntries.length,
+      }}
+    : null;
+{body}
+}})()
+"""
+
+
+_FOCUS_COMPOSER_JS = _with_visible_composer_js(
+    """
+  if (!composerInfo) {
+    return { ok: false, error: 'no-visible-composer', composerCount: composerNodes.length, visibleComposerCount: 0 };
+  }
+  const composer = composerInfo.composer;
   composer.focus();
   const selection = window.getSelection();
+  if (selection) {
+    const range = document.createRange();
+    range.selectNodeContents(composer);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+  const activeElement = document.activeElement;
+  const focused = activeElement === composer || composer.contains(activeElement);
+  return {
+    ok: focused,
+    error: focused ? null : 'composer-not-focused',
+    composerCount: composerInfo.composerCount,
+    visibleComposerCount: composerInfo.visibleComposerCount,
+  };
+"""
+)
+
+_CLEAR_COMPOSER_JS = _with_visible_composer_js(
+    """
+  if (!composerInfo) {
+    return { ok: false, error: 'no-visible-composer', composerCount: composerNodes.length, visibleComposerCount: 0 };
+  }
+  const composer = composerInfo.composer;
+  composer.focus();
+  const selection = window.getSelection();
+  if (!selection) {
+    return { ok: false, error: 'no-selection' };
+  }
   const range = document.createRange();
   range.selectNodeContents(composer);
-  range.collapse(false);
   selection.removeAllRanges();
   selection.addRange(range);
-  return { ok: true };
+  selection.deleteFromDocument();
+  composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
+  const text = composer.innerText ?? '';
+  return {
+    ok: !String(text).trim(),
+    error: String(text).trim() ? 'composer-not-cleared' : null,
+    text,
+    composerCount: composerInfo.composerCount,
+    visibleComposerCount: composerInfo.visibleComposerCount,
+  };
+"""
+)
+
+_COMPOSER_STATE_JS = _with_visible_composer_js(
+    """
+  if (!composerInfo) {
+    return { ok: false, error: 'no-visible-composer', composerCount: composerNodes.length, visibleComposerCount: 0 };
+  }
+  const composer = composerInfo.composer;
+  const activeElement = document.activeElement;
+  return {
+    ok: true,
+    text: composer.innerText ?? '',
+    focused: activeElement === composer || composer.contains(activeElement),
+    composerCount: composerInfo.composerCount,
+    visibleComposerCount: composerInfo.visibleComposerCount,
+  };
+"""
+)
+
+_THREAD_HEADER_TITLE_JS = """
+(() => {
+  const header = document.querySelector('header');
+  if (!header) return { ok: false, error: 'no-header' };
+
+  const candidates = [...header.querySelectorAll('.text-token-foreground')]
+    .map((node) => {
+      const rect = node.getBoundingClientRect();
+      const style = window.getComputedStyle(node);
+      const text = String(node.innerText || node.textContent || '').trim();
+      const visible =
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility !== 'hidden' &&
+        style.display !== 'none';
+      return {
+        text,
+        x: rect.x,
+        y: rect.y,
+        w: rect.width,
+        h: rect.height,
+        visible,
+      };
+    })
+    .filter((entry) => entry.visible && entry.text)
+    .sort((left, right) => {
+      if (left.y !== right.y) {
+        return left.y - right.y;
+      }
+      if (left.x !== right.x) {
+        return left.x - right.x;
+      }
+      return left.text.length - right.text.length;
+    });
+
+  const title = candidates[0];
+  if (!title) return { ok: false, error: 'no-header-title' };
+  return { ok: true, title: title.text };
 })()
 """
 
-_COMPOSER_STATE_JS = """
+_VISIBLE_BUTTONS_JS = """
 (() => {
-  const composer = document.querySelector('.ProseMirror[contenteditable="true"]');
-  if (!composer) return { ok: false };
-  return { ok: true, text: composer.innerText ?? '' };
+  const buttons = [];
+  const seen = new Set();
+
+  for (const node of document.querySelectorAll('button')) {
+    const rect = node.getBoundingClientRect();
+    const visible = rect.width > 0 && rect.height > 0 && !node.disabled && node.getAttribute('aria-hidden') !== 'true';
+    if (!visible) continue;
+
+    const labels = [
+      node.innerText || '',
+      node.textContent || '',
+      node.getAttribute('aria-label') || '',
+      node.getAttribute('title') || '',
+    ]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+
+    for (const label of labels) {
+      if (seen.has(label)) continue;
+      seen.add(label);
+      buttons.push(label);
+    }
+  }
+
+  return { buttons };
 })()
 """
 
@@ -1025,11 +1347,15 @@ def _project_button_center_js(project_path: str) -> str:
     return {{ ok: true, phase: 'expanded-group', groupLabel: group.label, groupPath: group.path }};
   }}
 
+  const matchesStartButton = (node) => {{
+    const aria = String(node?.getAttribute('aria-label') || '').trim().toLowerCase();
+    const expectedSuffix = ` in ${{group.label}}`.toLowerCase();
+    return aria.startsWith('start new ') && aria.endsWith(expectedSuffix);
+  }};
+
   const section = [...document.querySelectorAll('[role="listitem"]')].find((node) => {{
     if (node.getAttribute('aria-label') !== group.label) return false;
-    return [...node.querySelectorAll('button')].some(
-      (button) => button.getAttribute('aria-label') === `Start new thread in ${{group.label}}`
-    );
+    return [...node.querySelectorAll('button')].some(matchesStartButton);
   }});
   if (!section) {{
     return {{
@@ -1041,9 +1367,7 @@ def _project_button_center_js(project_path: str) -> str:
   }}
 
   section.scrollIntoView({{ block: 'center', inline: 'nearest' }});
-  const button = [...section.querySelectorAll('button')].find(
-    (node) => node.getAttribute('aria-label') === `Start new thread in ${{group.label}}`
-  );
+  const button = [...section.querySelectorAll('button')].find(matchesStartButton);
   if (!button) {{
     return {{
       ok: false,
@@ -1102,11 +1426,10 @@ def _click_text_button_js(labels: list[str]) -> str:
 
 
 def _click_send_button_js() -> str:
-    return """
-(() => {
-  const composer = document.querySelector('.ProseMirror[contenteditable="true"]');
-  if (!composer) return { ok: false, error: 'no-composer' };
-  const panel = composer.closest('div.bg-token-input-background');
+    return _with_visible_composer_js(
+        """
+  if (!composerInfo) return { ok: false, error: 'no-visible-composer' };
+  const panel = composerInfo.panel;
   if (!panel) return { ok: false, error: 'no-composer-panel' };
   const button = [...panel.querySelectorAll('button')]
     .filter((node) => {
@@ -1133,8 +1456,8 @@ def _click_send_button_js() -> str:
   if (button.disabled) return { ok: false, error: 'send-button-disabled' };
   button.click();
   return { ok: true };
-})()
 """
+    )
 
 
 def _raise_if_thread_turn_is_active(thread_id: str, conversation: DesktopConversation) -> None:
@@ -1145,6 +1468,24 @@ def _raise_if_thread_turn_is_active(thread_id: str, conversation: DesktopConvers
     raise DesktopClientError(
         f"Desktop thread {thread_id} is still running turn {turn_id}. Wait for it to finish, then retry."
     )
+
+
+def _header_matches_conversation(header_title: str | None, conversation: DesktopConversation) -> bool:
+    normalized_header = _normalize_header_title(header_title)
+    if not normalized_header:
+        return False
+    for candidate in [conversation.title, conversation.preview]:
+        normalized_candidate = _normalize_header_title(candidate)
+        if normalized_candidate and normalized_candidate == normalized_header:
+            return True
+    return False
+
+
+def _normalize_header_title(value: str | None) -> str:
+    if not isinstance(value, str):
+        return ""
+    first_line = value.splitlines()[0].strip()
+    return first_line.casefold()
 
 
 __all__ = [

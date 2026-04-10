@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
+import json
 import logging
 import os
 import signal
@@ -12,7 +13,9 @@ from pathlib import Path
 
 from .bridge import BridgeApp
 from .config import DEFAULT_CONFIG_PATH, EXAMPLE_CONFIG, ensure_parent_dirs, load_config
+from .diagnostics import collect_desktop_snapshot, collect_doctor_report, dump_json
 from .desktop_client import DesktopClientError
+from .logging_setup import configure_logging
 from .state import BridgeState
 from .telegram_api import TelegramApiError
 
@@ -31,6 +34,37 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_CONFIG_PATH,
         help=f"Path to config TOML (default: {DEFAULT_CONFIG_PATH})",
+    )
+
+    doctor_parser = subparsers.add_parser("doctor", help="Run machine-readable bridge diagnostics")
+    doctor_parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help=f"Path to config TOML (default: {DEFAULT_CONFIG_PATH})",
+    )
+    doctor_parser.add_argument(
+        "--out",
+        type=Path,
+        help="Optional path to write the JSON report",
+    )
+
+    snapshot_parser = subparsers.add_parser("desktop-snapshot", help="Print a machine-readable Codex Desktop snapshot")
+    snapshot_parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help=f"Path to config TOML (default: {DEFAULT_CONFIG_PATH})",
+    )
+    snapshot_parser.add_argument(
+        "--out",
+        type=Path,
+        help="Optional path to write the JSON snapshot",
+    )
+    snapshot_parser.add_argument(
+        "--screenshot",
+        type=Path,
+        help="Optional path to save a PNG screenshot from Codex Desktop",
     )
 
     init_parser = subparsers.add_parser("init-config", help="Print an example config to stdout")
@@ -68,17 +102,26 @@ def main() -> None:
             raise SystemExit(1) from None
         return
 
+    if args.command == "doctor":
+        raise SystemExit(asyncio.run(_doctor(args.config, args.out)))
+
+    if args.command == "desktop-snapshot":
+        raise SystemExit(asyncio.run(_desktop_snapshot(args.config, args.out, args.screenshot)))
+
     parser.error(f"Unknown command: {args.command}")
 
 
 async def _run(config_path: Path) -> None:
     config = load_config(config_path)
     ensure_parent_dirs(config)
-    logging.basicConfig(
-        level=getattr(logging, config.bridge.log_level, logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    logging_result = configure_logging(config.bridge)
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "Logging configured (bridge_log=%s, protocol_log=%s, console=%s)",
+        logging_result.log_path,
+        logging_result.protocol_log_path,
+        config.bridge.console_log,
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     state = BridgeState.load(config.bridge.state_path)
     state.reset_ephemeral_runtime_state()
@@ -91,6 +134,50 @@ async def _run(config_path: Path) -> None:
 
     with _hold_single_instance_lock(config.bridge.state_path):
         await app.run()
+
+
+async def _doctor(config_path: Path, out_path: Path | None) -> int:
+    payload: dict[str, object]
+    try:
+        config = load_config(config_path)
+        ensure_parent_dirs(config)
+        state = BridgeState.load(config.bridge.state_path)
+        payload = await collect_doctor_report(config, state)
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "stage": "doctor",
+            "config_path": str(config_path),
+            "error": str(exc),
+        }
+    _emit_json_payload(payload, out_path)
+    return 0 if payload.get("ok") else 1
+
+
+async def _desktop_snapshot(
+    config_path: Path,
+    out_path: Path | None,
+    screenshot_path: Path | None,
+) -> int:
+    payload: dict[str, object]
+    try:
+        config = load_config(config_path)
+        payload = await collect_desktop_snapshot(config, screenshot_path=screenshot_path)
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "stage": "desktop-snapshot",
+            "config_path": str(config_path),
+            "error": str(exc),
+        }
+    _emit_json_payload(payload, out_path)
+    return 0 if payload.get("ok") else 1
+
+
+def _emit_json_payload(payload: dict[str, object], out_path: Path | None) -> None:
+    if out_path is not None:
+        dump_json(out_path, payload)
+    print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
 
 
 @contextlib.contextmanager
