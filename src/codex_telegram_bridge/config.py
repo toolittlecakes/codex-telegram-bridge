@@ -35,7 +35,8 @@ class DesktopConfig:
     app_path: Path = DEFAULT_DESKTOP_APP_PATH
     user_data_dir: Path = DEFAULT_DESKTOP_USER_DATA_DIR
     remote_debugging_port: int = 9229
-    launch_timeout_seconds: float = 30.0
+    launch_timeout_seconds: float = 10.0
+    send_ack_timeout_seconds: float = 3.0
     poll_interval_seconds: float = 1.0
 
 
@@ -96,7 +97,8 @@ def load_config(path: Path | None) -> AppConfig:
         app_path=_expand_path(desktop_raw.get("app_path", DEFAULT_DESKTOP_APP_PATH)),
         user_data_dir=_expand_path(desktop_raw.get("user_data_dir", DEFAULT_DESKTOP_USER_DATA_DIR)),
         remote_debugging_port=int(desktop_raw.get("remote_debugging_port", 9229)),
-        launch_timeout_seconds=float(desktop_raw.get("launch_timeout_seconds", 30.0)),
+        launch_timeout_seconds=float(desktop_raw.get("launch_timeout_seconds", 10.0)),
+        send_ack_timeout_seconds=float(desktop_raw.get("send_ack_timeout_seconds", 3.0)),
         poll_interval_seconds=float(desktop_raw.get("poll_interval_seconds", 1.0)),
     )
 
@@ -140,7 +142,8 @@ delete_approval_messages = true
 app_path = "/Applications/Codex.app"
 user_data_dir = "~/Library/Application Support/com.openai.chat"
 remote_debugging_port = 9229
-launch_timeout_seconds = 30
+launch_timeout_seconds = 10
+send_ack_timeout_seconds = 3
 poll_interval_seconds = 1
 
 [bridge]

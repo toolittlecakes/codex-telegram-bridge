@@ -27,6 +27,7 @@ def build_desktop_client(config: AppConfig) -> CodexDesktopClient:
         remote_debugging_port=config.desktop.remote_debugging_port,
         user_data_dir=config.desktop.user_data_dir,
         launch_timeout_seconds=config.desktop.launch_timeout_seconds,
+        send_ack_timeout_seconds=config.desktop.send_ack_timeout_seconds,
         poll_interval_seconds=config.desktop.poll_interval_seconds,
     )
 

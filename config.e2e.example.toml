@@ -14,7 +14,8 @@ app_path = "/Applications/Codex.app"
 # Use a dedicated Codex Desktop profile for e2e runs.
 user_data_dir = "./.e2e/codex-profile"
 remote_debugging_port = 9239
-launch_timeout_seconds = 30
+launch_timeout_seconds = 10
+send_ack_timeout_seconds = 3
 poll_interval_seconds = 0.5
 
 [bridge]

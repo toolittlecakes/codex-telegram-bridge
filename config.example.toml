@@ -13,7 +13,8 @@ delete_approval_messages = true
 app_path = "/Applications/Codex.app"
 user_data_dir = "~/Library/Application Support/com.openai.chat"
 remote_debugging_port = 9229
-launch_timeout_seconds = 30
+launch_timeout_seconds = 10
+send_ack_timeout_seconds = 3
 poll_interval_seconds = 1
 
 [bridge]

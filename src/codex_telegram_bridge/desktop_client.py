@@ -128,12 +128,14 @@ class CodexDesktopClient:
         remote_debugging_port: int,
         user_data_dir: Path,
         launch_timeout_seconds: float,
+        send_ack_timeout_seconds: float,
         poll_interval_seconds: float,
     ) -> None:
         self._app_path = app_path
         self._remote_debugging_port = remote_debugging_port
         self._user_data_dir = user_data_dir
         self._launch_timeout_seconds = launch_timeout_seconds
+        self._send_ack_timeout_seconds = send_ack_timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
 
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=2.0))
@@ -298,7 +300,7 @@ class CodexDesktopClient:
             detail = f" ({error})" if isinstance(error, str) and error else ""
             raise DesktopClientError(f"Desktop send button is not available for a new thread{detail}.")
 
-        deadline = asyncio.get_running_loop().time() + self._launch_timeout_seconds
+        deadline = asyncio.get_running_loop().time() + self._send_ack_timeout_limit_seconds()
         while True:
             threads = await self.list_threads()
             for thread in threads:
@@ -367,7 +369,7 @@ class CodexDesktopClient:
             detail = f" ({error})" if isinstance(error, str) and error else ""
             raise DesktopClientError(f"Desktop send button is not available{detail}.")
 
-        deadline = asyncio.get_running_loop().time() + self._launch_timeout_seconds
+        deadline = asyncio.get_running_loop().time() + self._send_ack_timeout_limit_seconds()
         while True:
             current = await self.read_thread(thread_id)
             if current is not None and _conversation_has_user_message(
@@ -384,6 +386,9 @@ class CodexDesktopClient:
             expected_text=expected_text,
             after_turn_count=before_turn_count,
         )
+
+    def _send_ack_timeout_limit_seconds(self) -> float:
+        return min(self._launch_timeout_seconds, self._send_ack_timeout_seconds)
 
     async def click_approval_action(
         self,
@@ -793,18 +798,35 @@ def _conversation_has_user_message(
     if not normalized_expected:
         return False
     for turn in conversation.turns[after_turn_count:]:
-        for item in turn.items:
-            if item.get("type") != "userMessage":
+        if _turn_has_matching_user_input(turn, normalized_expected):
+            return True
+    return False
+
+
+def _turn_has_matching_user_input(turn: DesktopTurn, normalized_expected: str) -> bool:
+    for item in turn.items:
+        if item.get("type") != "userMessage":
+            continue
+        content = item.get("content") or []
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
                 continue
-            content = item.get("content") or []
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                text = part.get("text")
-                if isinstance(text, str) and text.strip() == normalized_expected:
-                    return True
+            text = part.get("text")
+            if isinstance(text, str) and text.strip() == normalized_expected:
+                return True
+
+    params = turn.raw.get("params") if isinstance(turn.raw, dict) else None
+    inputs = params.get("input") if isinstance(params, dict) else None
+    if not isinstance(inputs, list):
+        return False
+    for part in inputs:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text")
+        if isinstance(text, str) and text.strip() == normalized_expected:
+            return True
     return False
 
 

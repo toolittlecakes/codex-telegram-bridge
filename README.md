@@ -56,6 +56,14 @@ Set at least:
 - `telegram.bot_token`
 - optionally `desktop.app_path`
 - optionally `desktop.user_data_dir`
+- optionally `desktop.launch_timeout_seconds` and `desktop.send_ack_timeout_seconds`
+
+Desktop timeouts default to:
+
+```text
+desktop.launch_timeout_seconds = 10
+desktop.send_ack_timeout_seconds = 3
+```
 
 Then run:
 
