@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,6 +18,7 @@ from .desktop_client import (
     DesktopDraftConflictError,
     DesktopProject,
     DesktopRequest,
+    DesktopSendUnconfirmedError,
 )
 from .formatting import (
     chunk_text,
@@ -25,7 +27,7 @@ from .formatting import (
     format_turn_failure,
     render_markdown_chunks,
 )
-from .state import ApprovalCleanupMessage, BridgeState, QueuedInput, ThreadState
+from .state import ApprovalCleanupMessage, BridgeState, PendingSend, QueuedInput, ThreadState
 from .telegram_api import SentMessage, TelegramApiError, TelegramBotApi
 
 logger = logging.getLogger(__name__)
@@ -271,6 +273,18 @@ class BridgeApp:
         assert thread_id is not None
         thread_state = self.state.get_or_create_thread(thread_id)
         thread_state.primary_chat_id = chat_id
+
+        if thread_state.pending_send is not None:
+            await self._safe_send_message(
+                chat_id=chat_id,
+                text=(
+                    "The previous message is still waiting for confirmation from Codex Desktop. "
+                    "Wait a moment for it to resolve before sending another reply."
+                ),
+                reply_to_message_id=message_id,
+            )
+            return
+
         await self._safe_set_reaction(chat_id=chat_id, message_id=message_id, emoji=self.config.telegram.processing_reaction)
 
         if thread_state.current_turn_id:
@@ -817,6 +831,17 @@ class BridgeApp:
         self._threads_with_send_in_flight.add(thread_state.thread_id)
         try:
             conversation = await self.desktop.send_message(thread_state.thread_id, text)
+        except DesktopSendUnconfirmedError as exc:
+            logger.warning("Desktop send is awaiting confirmation for %s: %s", thread_state.thread_id, exc)
+            self.state.bind_message_reference(source_chat_id, source_message_id, thread_state.thread_id)
+            thread_state.pending_send = PendingSend(
+                chat_id=source_chat_id,
+                message_id=source_message_id,
+                text=text,
+                after_turn_count=exc.after_turn_count,
+            )
+            await self._save_state()
+            return
         except DesktopClientError as exc:
             logger.warning("Desktop send failed for %s: %s", thread_state.thread_id, exc)
             self._remove_pending_message(thread_state, source_message_id)
@@ -864,6 +889,8 @@ class BridgeApp:
 
         if await self._sync_approval_requests(thread_state, conversation):
             changed = True
+        if await self._reconcile_pending_send(thread_state, conversation):
+            changed = True
         if await self._sync_latest_user_input(thread_state, conversation):
             changed = True
         if await self._sync_turn_state(thread_state, conversation):
@@ -890,6 +917,42 @@ class BridgeApp:
             changed = True
 
         return changed
+
+    async def _reconcile_pending_send(self, thread_state: ThreadState, conversation: DesktopConversation) -> bool:
+        pending_send = thread_state.pending_send
+        if pending_send is None:
+            return False
+
+        key = self._pending_send_user_input_key(conversation, pending_send)
+        if key is not None:
+            thread_state.last_handled_user_input_key = key
+            if pending_send.message_id not in thread_state.pending_message_ids:
+                thread_state.pending_message_ids.append(pending_send.message_id)
+            thread_state.last_chain_message_id = pending_send.message_id
+            thread_state.pending_send = None
+            return True
+
+        pending_send.sync_miss_count += 1
+        if pending_send.sync_miss_count < self._pending_send_sync_miss_limit():
+            return True
+
+        logger.warning(
+            "Desktop send never materialized for %s after %s sync checks",
+            thread_state.thread_id,
+            pending_send.sync_miss_count,
+        )
+        self._remove_pending_message(thread_state, pending_send.message_id)
+        historical_key = self._latest_user_input_key_before_turn_count(conversation, pending_send.after_turn_count)
+        if historical_key is not None:
+            thread_state.last_handled_user_input_key = historical_key
+        await self._safe_set_reaction(chat_id=pending_send.chat_id, message_id=pending_send.message_id, emoji=None)
+        await self._safe_send_message(
+            chat_id=pending_send.chat_id,
+            text=f"Failed to send to Codex Desktop: Desktop did not create a new turn for thread {thread_state.thread_id}.",
+            reply_to_message_id=pending_send.message_id,
+        )
+        thread_state.pending_send = None
+        return True
 
     async def _create_approval_prompt(self, thread_state: ThreadState, request: DesktopRequest) -> bool:
         chat_id = self._chat_for_thread(thread_state)
@@ -981,7 +1044,7 @@ class BridgeApp:
         return changed
 
     async def _sync_latest_user_input(self, thread_state: ThreadState, conversation: DesktopConversation) -> bool:
-        if thread_state.thread_id in self._threads_with_send_in_flight:
+        if thread_state.thread_id in self._threads_with_send_in_flight or thread_state.pending_send is not None:
             return False
         key, text = self._latest_user_input_key_and_text(conversation)
         if key is None or text is None:
@@ -1239,11 +1302,15 @@ class BridgeApp:
         return thread_state.primary_chat_id or self.config.telegram.primary_chat_id or self.state.primary_chat_id
 
     def _reply_target_for_thread(self, thread_state: ThreadState) -> int | None:
+        if thread_state.pending_send is not None:
+            return thread_state.pending_send.message_id
         if thread_state.pending_message_ids:
             return thread_state.pending_message_ids[-1]
         return thread_state.last_chain_message_id
 
     def _reply_target_for_completion(self, thread_state: ThreadState) -> int | None:
+        if thread_state.pending_send is not None:
+            return thread_state.pending_send.message_id
         if thread_state.pending_message_ids:
             return thread_state.pending_message_ids[-1]
         return thread_state.last_chain_message_id
@@ -1508,6 +1575,43 @@ class BridgeApp:
         key, _ = self._latest_user_input_key_and_text(conversation)
         if key is not None:
             thread_state.last_handled_user_input_key = key
+
+    def _pending_send_user_input_key(
+        self,
+        conversation: DesktopConversation,
+        pending_send: PendingSend,
+    ) -> str | None:
+        expected_text = pending_send.text.strip()
+        if not expected_text:
+            return None
+        for turn in conversation.turns[pending_send.after_turn_count :]:
+            for item in turn.items:
+                if item.get("type") != "userMessage":
+                    continue
+                text = self._user_message_text(item)
+                if text is None or text.strip() != expected_text:
+                    continue
+                key = self._user_input_key(turn.turn_id, item, text)
+                if key is not None:
+                    return key
+        return None
+
+    def _pending_send_sync_miss_limit(self) -> int:
+        poll_interval = max(self.config.desktop.poll_interval_seconds, 0.1)
+        return max(3, math.ceil(self.config.desktop.launch_timeout_seconds / poll_interval))
+
+    def _latest_user_input_key_before_turn_count(self, conversation: DesktopConversation, turn_count: int) -> str | None:
+        for turn in reversed(conversation.turns[:turn_count]):
+            for item in reversed(turn.items):
+                if item.get("type") != "userMessage":
+                    continue
+                text = self._user_message_text(item)
+                if text is None:
+                    continue
+                key = self._user_input_key(turn.turn_id, item, text)
+                if key is not None:
+                    return key
+        return None
 
     def _latest_user_input_key_and_text(self, conversation: DesktopConversation) -> tuple[str | None, str | None]:
         for turn in reversed(conversation.turns):

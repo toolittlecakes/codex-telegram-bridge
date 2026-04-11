@@ -15,6 +15,15 @@ class QueuedInput:
 
 
 @dataclass(slots=True)
+class PendingSend:
+    chat_id: int
+    message_id: int
+    text: str
+    after_turn_count: int
+    sync_miss_count: int = 0
+
+
+@dataclass(slots=True)
 class ThreadState:
     thread_id: str
     primary_chat_id: int | None = None
@@ -24,6 +33,7 @@ class ThreadState:
     last_handled_user_input_key: str | None = None
     current_turn_id: str | None = None
     pending_message_ids: list[int] = field(default_factory=list)
+    pending_send: PendingSend | None = None
     queued_inputs: list[QueuedInput] = field(default_factory=list)
     preview: str | None = None
 
@@ -36,7 +46,7 @@ class ApprovalCleanupMessage:
 
 @dataclass(slots=True)
 class BridgeState:
-    version: int = 3
+    version: int = 4
     telegram_update_offset: int = 0
     next_callback_key: int = 0
     primary_chat_id: int | None = None
@@ -52,6 +62,7 @@ class BridgeState:
         threads: dict[str, ThreadState] = {}
         for thread_id, thread_raw in (raw.get("threads") or {}).items():
             queued = [QueuedInput(**item) for item in thread_raw.get("queued_inputs", [])]
+            pending_send_raw = thread_raw.get("pending_send")
             threads[thread_id] = ThreadState(
                 thread_id=thread_id,
                 primary_chat_id=thread_raw.get("primary_chat_id"),
@@ -61,6 +72,7 @@ class BridgeState:
                 last_handled_user_input_key=thread_raw.get("last_handled_user_input_key"),
                 current_turn_id=thread_raw.get("current_turn_id"),
                 pending_message_ids=list(thread_raw.get("pending_message_ids", [])),
+                pending_send=PendingSend(**pending_send_raw) if isinstance(pending_send_raw, dict) else None,
                 queued_inputs=queued,
                 preview=thread_raw.get("preview"),
             )
@@ -91,6 +103,7 @@ class BridgeState:
                     "last_handled_user_input_key": state.last_handled_user_input_key,
                     "current_turn_id": state.current_turn_id,
                     "pending_message_ids": state.pending_message_ids,
+                    "pending_send": asdict(state.pending_send) if state.pending_send is not None else None,
                     "queued_inputs": [asdict(item) for item in state.queued_inputs],
                     "preview": state.preview,
                 }
@@ -116,6 +129,11 @@ class BridgeState:
         thread.primary_chat_id = thread.primary_chat_id or chat_id
         thread.last_chain_message_id = message_id
 
+    def bind_message_reference(self, chat_id: int, message_id: int, thread_id: str) -> None:
+        self.message_bindings[self._message_key(chat_id, message_id)] = thread_id
+        thread = self.get_or_create_thread(thread_id)
+        thread.primary_chat_id = thread.primary_chat_id or chat_id
+
     def lookup_thread_for_message(self, chat_id: int, message_id: int) -> str | None:
         return self.message_bindings.get(self._message_key(chat_id, message_id))
 
@@ -139,6 +157,7 @@ class BridgeState:
 __all__ = [
     "ApprovalCleanupMessage",
     "BridgeState",
+    "PendingSend",
     "QueuedInput",
     "ThreadState",
 ]

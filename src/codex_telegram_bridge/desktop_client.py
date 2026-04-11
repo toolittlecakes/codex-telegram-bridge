@@ -33,6 +33,14 @@ class DesktopDraftConflictError(DesktopClientError):
         )
 
 
+class DesktopSendUnconfirmedError(DesktopClientError):
+    def __init__(self, *, thread_id: str, expected_text: str, after_turn_count: int) -> None:
+        self.thread_id = thread_id
+        self.expected_text = expected_text
+        self.after_turn_count = after_turn_count
+        super().__init__(f"Desktop did not create a new turn for thread {thread_id}.")
+
+
 @dataclass(slots=True)
 class DesktopSessionInfo:
     debugger_url: str
@@ -371,7 +379,11 @@ class CodexDesktopClient:
             if asyncio.get_running_loop().time() > deadline:
                 break
             await asyncio.sleep(self._poll_interval_seconds)
-        raise DesktopClientError(f"Desktop did not create a new turn for thread {thread_id}.")
+        raise DesktopSendUnconfirmedError(
+            thread_id=thread_id,
+            expected_text=expected_text,
+            after_turn_count=before_turn_count,
+        )
 
     async def click_approval_action(
         self,
@@ -1493,6 +1505,7 @@ __all__ = [
     "DesktopClientError",
     "DesktopConversation",
     "DesktopConversationSummary",
+    "DesktopSendUnconfirmedError",
     "DesktopProject",
     "DesktopRequest",
     "DesktopSessionInfo",
