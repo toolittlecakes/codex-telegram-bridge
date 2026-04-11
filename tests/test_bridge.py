@@ -793,7 +793,7 @@ async def test_sync_thread_mirrors_codex_side_user_message_into_telegram(app: Br
     thread = app.state.get_or_create_thread("thr_1")
     thread.primary_chat_id = 1234
     thread.last_chain_message_id = 111
-    thread.last_handled_user_input_key = "turn:turn_1"
+    thread.last_handled_user_input_key = "turn:turn_1:old"
     app.desktop.threads["thr_1"] = make_conversation(
         "thr_1",
         title="Thread 1",
@@ -815,7 +815,8 @@ async def test_sync_thread_mirrors_codex_side_user_message_into_telegram(app: Br
             "disable_notification": False,
         }
     ]
-    assert thread.last_handled_user_input_key == "turn:turn_2"
+    assert thread.last_handled_user_input_key is not None
+    assert thread.last_handled_user_input_key.startswith("turn:turn_2:")
     assert thread.last_chain_message_id == 10001
     assert app.state.lookup_thread_for_message(1234, 10001) == "thr_1"
 
@@ -851,7 +852,8 @@ async def test_sync_thread_does_not_echo_telegram_originated_user_message_back_i
     await app._sync_thread("thr_1")
 
     assert app.telegram.sent_messages == []
-    assert thread.last_handled_user_input_key == "turn:turn_2"
+    assert thread.last_handled_user_input_key is not None
+    assert thread.last_handled_user_input_key.startswith("turn:turn_2:")
 
 
 @pytest.mark.asyncio
@@ -896,7 +898,75 @@ async def test_sync_thread_does_not_echo_telegram_message_during_inflight_send(a
     await send_task
 
     assert app.telegram.sent_messages == []
-    assert thread.last_handled_user_input_key == "turn:turn_2"
+    assert thread.last_handled_user_input_key is not None
+    assert thread.last_handled_user_input_key.startswith("turn:turn_2:")
+
+
+@pytest.mark.asyncio
+async def test_sync_thread_does_not_echo_hydrated_user_message_after_params_only_send_ack(app: BridgeApp) -> None:
+    app.state.primary_chat_id = 1234
+    thread = app.state.get_or_create_thread("thr_1")
+    thread.primary_chat_id = 1234
+    thread.last_chain_message_id = 200
+    app.state.bind_message(1234, 200, "thr_1")
+
+    acked = make_conversation(
+        "thr_1",
+        title="Thread 1",
+        turns=[
+            make_turn("turn_1", "completed", items=[make_user_message_item("old")]),
+            make_turn(
+                "turn_2",
+                "inProgress",
+                items=[],
+                params={"input": [{"type": "text", "text": "follow up"}]},
+            ),
+        ],
+    )
+    hydrated = make_conversation(
+        "thr_1",
+        title="Thread 1",
+        turns=[
+            make_turn("turn_1", "completed", items=[make_user_message_item("old")]),
+            make_turn(
+                "turn_2",
+                "completed",
+                items=[
+                    {"id": "user_2", **make_user_message_item("follow up")},
+                    {"id": "item_2", "type": "agentMessage", "text": "Checked."},
+                ],
+            ),
+        ],
+    )
+    app.desktop.send_results[("thr_1", "follow up")] = acked
+
+    await app._process_telegram_update(
+        {
+            "message": {
+                "message_id": 201,
+                "chat": {"id": 1234, "type": "private"},
+                "from": {"id": 1, "is_bot": False},
+                "text": "follow up",
+                "reply_to_message": {"message_id": 200},
+            }
+        }
+    )
+
+    app.desktop.threads["thr_1"] = hydrated
+    await app._sync_thread("thr_1")
+
+    assert app.telegram.sent_messages == [
+        {
+            "chat_id": 1234,
+            "text": "Checked.",
+            "reply_to_message_id": 201,
+            "entities": None,
+            "inline_keyboard": None,
+            "disable_notification": False,
+        }
+    ]
+    assert thread.last_handled_user_input_key is not None
+    assert thread.last_handled_user_input_key.startswith("turn:turn_2:")
 
 
 @pytest.mark.asyncio
@@ -1571,12 +1641,12 @@ def test_bridge_state_round_trips_last_handled_user_input_key(tmp_path: Path) ->
     state_path = tmp_path / "state.json"
     state = BridgeState()
     thread = state.get_or_create_thread("thr_1")
-    thread.last_handled_user_input_key = "turn:turn_2"
+    thread.last_handled_user_input_key = "turn:turn_2:abc"
 
     state.save(state_path)
     loaded = BridgeState.load(state_path)
 
-    assert loaded.threads["thr_1"].last_handled_user_input_key == "turn:turn_2"
+    assert loaded.threads["thr_1"].last_handled_user_input_key == "turn:turn_2:abc"
 
 
 def test_bridge_state_load_ignores_legacy_pending_send(tmp_path: Path) -> None:

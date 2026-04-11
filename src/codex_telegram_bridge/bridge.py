@@ -1482,30 +1482,48 @@ class BridgeApp:
 
     def _latest_user_input_key_before_turn_count(self, conversation: DesktopConversation, turn_count: int) -> str | None:
         for turn in reversed(conversation.turns[:turn_count]):
-            for item in reversed(turn.items):
-                if item.get("type") != "userMessage":
-                    continue
-                text = self._user_message_text(item)
-                if text is None:
-                    continue
-                key = self._user_input_key(turn.turn_id, item, text)
-                if key is not None:
-                    return key
+            key, _ = self._turn_latest_user_input_key_and_text(turn)
+            if key is not None:
+                return key
         return None
 
     def _latest_user_input_key_and_text(self, conversation: DesktopConversation) -> tuple[str | None, str | None]:
         for turn in reversed(conversation.turns):
-            for item in reversed(turn.items):
-                if item.get("type") != "userMessage":
-                    continue
-                text = self._user_message_text(item)
-                if text is None:
-                    continue
-                key = self._user_input_key(turn.turn_id, item, text)
-                if key is None:
-                    continue
+            key, text = self._turn_latest_user_input_key_and_text(turn)
+            if key is not None and text is not None:
                 return key, text
         return None, None
+
+    def _turn_latest_user_input_key_and_text(self, turn: Any) -> tuple[str | None, str | None]:
+        for item in reversed(turn.items):
+            if item.get("type") != "userMessage":
+                continue
+            text = self._user_message_text(item)
+            if text is None:
+                continue
+            key = self._user_input_key(turn.turn_id, item, text)
+            if key is not None:
+                return key, text
+
+        raw_turn = turn.raw if isinstance(turn.raw, dict) else None
+        params = raw_turn.get("params") if isinstance(raw_turn, dict) else None
+        inputs = params.get("input") if isinstance(params, dict) else None
+        if not isinstance(inputs, list):
+            return None, None
+        parts: list[str] = []
+        for part in inputs:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        combined = "".join(parts).strip()
+        if not combined:
+            return None, None
+        key = self._user_input_key(turn.turn_id, {}, combined)
+        if key is None:
+            return None, None
+        return key, combined
 
     def _user_message_text(self, item: dict[str, Any]) -> str | None:
         content = item.get("content") or []
@@ -1522,12 +1540,13 @@ class BridgeApp:
         return combined or None
 
     def _user_input_key(self, turn_id: str | None, item: dict[str, Any], text: str) -> str | None:
+        normalized = text.strip()
+        if turn_id and normalized:
+            digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+            return f"turn:{turn_id}:{digest}"
         item_id = item.get("id")
         if item_id is not None:
             return f"item:{item_id}"
-        if turn_id:
-            return f"turn:{turn_id}"
-        normalized = text.strip()
         if not normalized:
             return None
         digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
