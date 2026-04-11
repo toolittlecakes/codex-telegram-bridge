@@ -882,9 +882,9 @@ async def test_sync_thread_mirrors_codex_side_user_message_into_telegram(app: Br
     assert app.telegram.sent_messages == [
         {
             "chat_id": 1234,
-            "text": "written in codex",
+            "text": "User:\n\nwritten in codex",
             "reply_to_message_id": 111,
-            "entities": None,
+            "entities": [{"type": "blockquote", "offset": 7, "length": 16}],
             "inline_keyboard": None,
             "disable_notification": False,
         }

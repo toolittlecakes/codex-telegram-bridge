@@ -21,7 +21,6 @@ from .desktop_client import (
     DesktopSendUnconfirmedError,
 )
 from .formatting import (
-    chunk_text,
     extract_latest_agent_message_from_turn,
     format_approval_prompt,
     format_turn_failure,
@@ -1053,7 +1052,11 @@ class BridgeApp:
             return False
 
         reply_to = self._reply_target_for_thread(thread_state)
-        sent = await self._send_thread_plain_text_reply(thread_state, text=text, reply_to_message_id=reply_to)
+        sent = await self._send_thread_text_reply(
+            thread_state,
+            text=self._format_mirrored_user_input(text),
+            reply_to_message_id=reply_to,
+        )
         if sent is None:
             return False
         thread_state.last_handled_user_input_key = key
@@ -1150,46 +1153,6 @@ class BridgeApp:
                 reply_to_message_id=current_reply_to,
                 fallback_reply_to_message_id=fallback_reply_to,
                 entities=chunk.entities or None,
-            )
-            if sent is None:
-                for partial in reversed(sent_messages):
-                    with contextlib.suppress(Exception):
-                        await self.telegram.delete_message(chat_id=partial.chat_id, message_id=partial.message_id)
-                return None
-            if first_sent is None:
-                first_sent = sent
-            sent_messages.append(sent)
-            current_reply_to = sent.message_id
-        for sent in sent_messages:
-            self.state.bind_message(chat_id, sent.message_id, thread_state.thread_id)
-        if sent_messages:
-            thread_state.last_chain_message_id = sent_messages[-1].message_id
-        return first_sent
-
-    async def _send_thread_plain_text_reply(
-        self,
-        thread_state: ThreadState,
-        *,
-        text: str,
-        reply_to_message_id: int | None,
-    ) -> SentMessage | None:
-        chat_id = self._chat_for_thread(thread_state)
-        if chat_id is None:
-            logger.warning("No Telegram chat bound for thread %s", thread_state.thread_id)
-            return None
-
-        first_sent: SentMessage | None = None
-        sent_messages: list[SentMessage] = []
-        current_reply_to = reply_to_message_id
-        for chunk in chunk_text(text, self.config.bridge.max_message_chars):
-            fallback_reply_to = None
-            if current_reply_to is not None and current_reply_to != thread_state.last_chain_message_id:
-                fallback_reply_to = thread_state.last_chain_message_id
-            sent = await self._safe_send_message(
-                chat_id=chat_id,
-                text=chunk,
-                reply_to_message_id=current_reply_to,
-                fallback_reply_to_message_id=fallback_reply_to,
             )
             if sent is None:
                 for partial in reversed(sent_messages):
@@ -1575,6 +1538,12 @@ class BridgeApp:
         key, _ = self._latest_user_input_key_and_text(conversation)
         if key is not None:
             thread_state.last_handled_user_input_key = key
+
+    def _format_mirrored_user_input(self, text: str) -> str:
+        quoted_lines = [">" if not line else f"> {line}" for line in text.strip().splitlines()]
+        if not quoted_lines:
+            quoted_lines = [">"]
+        return "User:\n" + "\n".join(quoted_lines)
 
     def _pending_send_user_input_key(
         self,
